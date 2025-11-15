@@ -34,7 +34,12 @@ class StrategyFeedbackManager:
             from core.paths import get_strategy_feedback_dir
             storage_dir = str(get_strategy_feedback_dir())
         self.storage_dir = Path(storage_dir)
-        self.storage_dir.mkdir(parents=True, exist_ok=True)
+        # Only try to create directory if not on read-only filesystem
+        try:
+            self.storage_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            # If we can't create it, continue anyway (might be read-only)
+            pass
         
         # In-memory cache for active feedback
         self._feedback_cache: Dict[str, List[StrategyFeedback]] = {}

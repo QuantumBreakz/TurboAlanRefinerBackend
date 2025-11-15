@@ -28,7 +28,12 @@ class FileVersionManager:
             from core.paths import get_file_versions_dir
             storage_dir = str(get_file_versions_dir())
         self.storage_dir = Path(storage_dir)
-        self.storage_dir.mkdir(parents=True, exist_ok=True)
+        # Only try to create directory if not on read-only filesystem
+        try:
+            self.storage_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            # If we can't create it, continue anyway (might be read-only)
+            pass
         
         # In-memory cache for active versions with size limit
         self._versions_cache: Dict[str, Dict[int, FileVersion]] = {}
