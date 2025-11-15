@@ -2,24 +2,20 @@
   "version": 2,
   "builds": [
     {
-      "src": "api/main.py",
+      "src": "api/vercel_handler.py",
       "use": "@vercel/python"
     }
   ],
   "routes": [
     {
       "src": "/(.*)",
-      "dest": "api/main.py"
+      "dest": "api/vercel_handler.py"
     }
   ],
-  "env": {
-    "PYTHON_VERSION": "3.11"
-  },
   "functions": {
-    "api/main.py": {
+    "api/vercel_handler.py": {
       "maxDuration": 300,
       "memory": 1024
     }
   }
 }
-
