@@ -3,11 +3,11 @@
   "routes": [
     {
       "src": "/(.*)",
-      "dest": "api/vercel_handler.py"
+      "dest": "api/index.py"
     }
   ],
   "functions": {
-    "api/**/*.py": {
+    "api/index.py": {
       "maxDuration": 300,
       "memory": 1024
     }
