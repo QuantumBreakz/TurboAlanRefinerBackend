@@ -705,13 +705,16 @@ def get_google_credentials(credentials_path: str = None, token_path: str = None)
             # Fix private key if it has escaped newlines (common when pasting JSON into env vars)
             if 'private_key' in creds_data:
                 private_key = creds_data['private_key']
-                # Handle escaped newlines - replace \\n (escaped) with actual newlines
-                # This handles cases where JSON is pasted into env vars and newlines get escaped
-                if isinstance(private_key, str):
-                    # Replace all escaped newline variations
+                if not isinstance(private_key, str):
+                    raise ValueError(f"Private key must be a string, got {type(private_key)}")
+                
+                # When JSON is parsed, \n in the JSON string becomes actual newline
+                # But if the env var was set incorrectly, we might have literal \n strings
+                # Check if we have literal backslash-n sequences (not actual newlines)
+                if '\\n' in private_key and '\n' not in private_key:
+                    # We have escaped newlines that weren't converted - fix them
                     private_key = private_key.replace('\\n', '\n')
-                    # Also handle double-escaped (rare but possible)
-                    private_key = private_key.replace('\\\\n', '\n')
+                
                 # Ensure proper format - find BEGIN marker if it's not at the start
                 if not private_key.startswith('-----BEGIN'):
                     begin_idx = private_key.find('-----BEGIN')
@@ -719,6 +722,16 @@ def get_google_credentials(credentials_path: str = None, token_path: str = None)
                         private_key = private_key[begin_idx:]
                     elif begin_idx == -1:
                         raise ValueError("Private key does not contain '-----BEGIN PRIVATE KEY-----' marker")
+                
+                # Validate the key has proper structure
+                if not private_key.endswith('-----END PRIVATE KEY-----\n') and not private_key.endswith('-----END PRIVATE KEY-----'):
+                    # Try to find the end marker
+                    end_idx = private_key.find('-----END PRIVATE KEY-----')
+                    if end_idx > 0:
+                        private_key = private_key[:end_idx + len('-----END PRIVATE KEY-----')]
+                    else:
+                        raise ValueError("Private key does not contain '-----END PRIVATE KEY-----' marker")
+                
                 creds_data['private_key'] = private_key
             
             # Validate private key format
