@@ -1081,6 +1081,33 @@ async def cleanup_stale_tasks():
 # Job storage for analytics (in production, use proper database)
 _jobs_storage: Dict[str, Dict[str, Any]] = {}
 
+@app.get("/")
+async def root() -> Dict[str, Any]:
+    """
+    Root endpoint providing API information.
+    
+    Returns:
+        Dictionary with API information and available endpoints
+    """
+    return {
+        "name": "Turbo Alan Refiner API",
+        "version": "3.0.0",
+        "status": "running",
+        "docs": "/docs",
+        "health": "/health",
+        "endpoints": {
+            "health": "/health",
+            "health_fast": "/health/fast",
+            "jobs": "/jobs",
+            "settings": "/settings",
+            "analytics": "/analytics/summary",
+            "schema": "/schema",
+            "refine": "/refine/run",
+            "files": "/files",
+            "drive": "/drive/files"
+        }
+    }
+
 @app.get("/health")
 async def health() -> Dict[str, Any]:
     """Comprehensive health check endpoint with fail-closed approach."""
