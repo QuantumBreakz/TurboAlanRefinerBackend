@@ -693,9 +693,8 @@ def get_google_credentials(credentials_path: str = None, token_path: str = None)
     google_creds_json = os.getenv('GOOGLE_CREDENTIALS_JSON')
     if google_creds_json:
         try:
-            import json as json_module
             # Parse JSON - handle escaped newlines in private key
-            creds_data = json_module.loads(google_creds_json)
+            creds_data = _json.loads(google_creds_json)
             
             # Fix private key if it has escaped newlines (common when pasting JSON into env vars)
             if 'private_key' in creds_data:
@@ -718,7 +717,7 @@ def get_google_credentials(credentials_path: str = None, token_path: str = None)
             
             # Write credentials to temp file
             with open(temp_file, 'w') as f:
-                json_module.dump(creds_data, f)
+                _json.dump(creds_data, f)
             
             # Load credentials from temp file
             creds = service_account.Credentials.from_service_account_file(
