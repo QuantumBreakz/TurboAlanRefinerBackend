@@ -11,27 +11,14 @@ from typing import Any, Dict, Optional
 
 def _backend_root() -> str:
     """Returns the backend directory root."""
-    return os.path.dirname(os.path.abspath(__file__))
+    from core.paths import get_backend_root
+    return str(get_backend_root())
 
 
 def get_log_dir() -> str:
     """Returns the logs directory within backend folder."""
-    # Check if we're in a Vercel/serverless environment
-    is_vercel = os.getenv('VERCEL') == '1' or os.getenv('VERCEL_ENV') is not None
-    
-    if is_vercel:
-        # Use /tmp/logs in serverless environments (only writable location)
-        logs = '/tmp/logs'
-    else:
-        # Default to backend/logs
-        backend_dir = _backend_root()
-        logs = os.path.join(backend_dir, 'logs')
-    
-    try:
-        os.makedirs(logs, exist_ok=True)
-    except Exception:
-        pass
-    return logs
+    from core.paths import get_logs_dir
+    return str(get_logs_dir())
 
 
 def get_logger(name: str = 'refiner', level: Optional[int] = None) -> logging.Logger:
@@ -67,25 +54,19 @@ def get_logger(name: str = 'refiner', level: Optional[int] = None) -> logging.Lo
         datefmt='%Y-%m-%dT%H:%M:%SZ'
     )
     
-    # File handler with rotation (skip if we can't create the file)
-    try:
-        log_path = os.path.join(get_log_dir(), 'refiner.log')
-        file_handler = logging.handlers.RotatingFileHandler(
-            log_path, 
-            maxBytes=5*1024*1024,  # 5MB (reduced for better management)
-            backupCount=3,  # Keep only 3 backup files
-            encoding='utf-8'
-        )
-        file_handler.setFormatter(formatter)
-        logger.addHandler(file_handler)
-    except (OSError, PermissionError, FileNotFoundError) as e:
-        # In serverless environments or if file logging fails, use console only
-        # This prevents crashes when filesystem is read-only
-        pass
+    # File handler with rotation
+    log_path = os.path.join(get_log_dir(), 'refiner.log')
+    file_handler = logging.handlers.RotatingFileHandler(
+        log_path, 
+        maxBytes=5*1024*1024,  # 5MB (reduced for better management)
+        backupCount=3,  # Keep only 3 backup files
+        encoding='utf-8'
+    )
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
     
-    # Console handler - always add in serverless, or if DEBUG is set
-    is_vercel = os.getenv('VERCEL') == '1' or os.getenv('VERCEL_ENV') is not None
-    if os.getenv('DEBUG') or is_vercel:
+    # Console handler for development
+    if os.getenv('DEBUG'):
         console_handler = logging.StreamHandler()
         console_handler.setFormatter(formatter)
         logger.addHandler(console_handler)

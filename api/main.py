@@ -10,7 +10,7 @@ import io
 import requests
 import threading
 import logging
-from typing import AsyncGenerator, Dict, Any, List, Optional
+from typing import AsyncGenerator, Dict, Any, List, Optional, Union, Tuple
 import uuid
 from pathlib import Path
 from datetime import datetime
@@ -195,40 +195,66 @@ def get_drive_service_oauth():
 def _check_google_drive_connection() -> bool:
     """Check if Google Drive is properly connected and authenticated with comprehensive validation."""
     try:
-        # Check if credentials file exists and is readable
-        # Get backend directory
-        backend_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        default_creds = os.path.join(backend_dir, 'config', 'google_credentials.json')
-        creds_file = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE", default_creds)
-        if not os.path.exists(creds_file):
-            return False
+        import json as _json
         
-        if not os.access(creds_file, os.R_OK):
-            return False
+        # Check for credentials in environment variables first
+        service_account_json = os.getenv('GOOGLE_SERVICE_ACCOUNT_JSON')
+        service_account_file = os.getenv('GOOGLE_SERVICE_ACCOUNT_FILE')
+        oauth_credentials_json = os.getenv('GOOGLE_OAUTH_CREDENTIALS_JSON')
         
-        # Try to load and validate credentials file structure
-        try:
-            with open(creds_file, 'r') as f:
-                creds_data = json.load(f)
-            
-            # Validate required fields
-            required_fields = ['type', 'project_id', 'private_key', 'client_email']
-            if not all(field in creds_data for field in required_fields):
+        # Validate service account JSON from env var
+        if service_account_json:
+            try:
+                creds_data = _json.loads(service_account_json)
+                required_fields = ['type', 'project_id', 'private_key', 'client_email']
+                if not all(field in creds_data for field in required_fields):
+                    return False
+                if creds_data.get('type') != 'service_account':
+                    return False
+                private_key = creds_data.get('private_key', '')
+                if not private_key.startswith('-----BEGIN PRIVATE KEY-----'):
+                    return False
+            except (_json.JSONDecodeError, KeyError, ValueError):
                 return False
-            
-            # Validate credential type
-            if creds_data.get('type') != 'service_account':
-                return False
-            
-            # Validate private key format
-            private_key = creds_data.get('private_key', '')
-            if not private_key.startswith('-----BEGIN PRIVATE KEY-----'):
-                return False
-            
-        except (json.JSONDecodeError, KeyError, ValueError):
-            return False
         
-        # Check OAuth credentials
+        # Validate service account file if specified
+        elif service_account_file:
+            if not os.path.exists(service_account_file):
+                return False
+            if not os.access(service_account_file, os.R_OK):
+                return False
+            try:
+                with open(service_account_file, 'r') as f:
+                    creds_data = _json.load(f)
+                required_fields = ['type', 'project_id', 'private_key', 'client_email']
+                if not all(field in creds_data for field in required_fields):
+                    return False
+                if creds_data.get('type') != 'service_account':
+                    return False
+                private_key = creds_data.get('private_key', '')
+                if not private_key.startswith('-----BEGIN PRIVATE KEY-----'):
+                    return False
+            except (_json.JSONDecodeError, KeyError, ValueError):
+                return False
+        
+        # Check OAuth credentials from env var
+        elif oauth_credentials_json:
+            try:
+                creds_data = _json.loads(oauth_credentials_json)
+                # OAuth credentials should have client_id and client_secret
+                if 'client_id' not in creds_data or 'client_secret' not in creds_data:
+                    return False
+            except (_json.JSONDecodeError, KeyError):
+                return False
+        
+        # Fallback: Check if default file exists (for backward compatibility)
+        else:
+            backend_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            default_creds = os.path.join(backend_dir, 'config', 'google_credentials.json')
+            if not os.path.exists(default_creds):
+                return False
+        
+        # Try to get credentials and validate
         creds = get_google_credentials()
         if not creds:
             return False
@@ -254,43 +280,27 @@ def _check_google_drive_connection() -> bool:
         
     except Exception:
         return False
-# Helper function to get backend-relative paths
+# Import centralized path configuration
+from core.paths import (
+    get_backend_root,
+    get_output_dir,
+    get_templates_dir,
+    get_config_dir,
+    sanitize_path
+)
+
+# Helper functions for backward compatibility (now use centralized paths)
 def _get_backend_dir() -> str:
     """Returns the backend directory root."""
-    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return str(get_backend_root())
 
 def _get_output_dir() -> str:
     """Returns the default output directory within backend."""
-    # Check if we're in a Vercel/serverless environment
-    is_vercel = os.getenv('VERCEL') == '1' or os.getenv('VERCEL_ENV') is not None
-    
-    if is_vercel:
-        # Use /tmp/data/output in serverless environments (only writable location)
-        output_dir = '/tmp/data/output'
-        os.makedirs(output_dir, exist_ok=True)
-        return output_dir
-    
-    backend_dir = _get_backend_dir()
-    env_output_dir = os.getenv("REFINER_OUTPUT_DIR")
-    
-    if env_output_dir:
-        # If absolute path, use as-is
-        if os.path.isabs(env_output_dir):
-            output_dir = env_output_dir
-        else:
-            # If relative path, resolve relative to backend directory
-            output_dir = os.path.join(backend_dir, env_output_dir)
-    else:
-        # Default to backend/data/output
-        output_dir = os.path.join(backend_dir, "data", "output")
-    
-    os.makedirs(output_dir, exist_ok=True)
-    return output_dir
+    return str(get_output_dir())
 
 def _get_templates_dir() -> str:
     """Returns the templates directory within backend."""
-    backend_dir = _get_backend_dir()
-    return os.path.join(backend_dir, "templates")
+    return str(get_templates_dir())
 
 # Memory limits for shared state
 MAX_UPLOADED_FILES = 1000
@@ -362,10 +372,23 @@ from language_model import OpenAIModel, analytics_store  # ⭐ REAL MODEL
 from storage import LocalSink, DriveSink  # ⭐ REAL STORAGE
 from Andy_speech import RefinementMemory, refine_with_feedback  # ⭐ REAL MEMORY + FEEDBACK
 from prompt_schema import ADVANCED_COMMANDS  # ⭐ REAL SCHEMA
-from core.database import list_jobs as db_list_jobs
+# Removed duplicate import - list_jobs already imported above
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    """Application lifespan manager for startup and shutdown tasks."""
+    # Startup: Validate environment variables
+    try:
+        from core.env_validation import validate_required_env_vars, get_env_summary
+        validated_env = validate_required_env_vars()
+        env_summary = get_env_summary()
+        logger.info(f"Environment validation passed. Config: {env_summary}")
+    except Exception as e:
+        logger.error(f"Environment validation failed: {e}")
+        # Don't fail startup in development, but log the error
+        if os.getenv("VERCEL") or os.getenv("PRODUCTION"):
+            raise
+    
     # Startup: eager init pipeline to avoid lazy-load lock hang
     logger.info("Initializing pipeline at startup...")
     try:
@@ -373,11 +396,13 @@ async def lifespan(app: FastAPI):
         logger.info("Pipeline initialized successfully")
     except Exception as e:
         logger.error(f"Pipeline init error: {e}")
+    
     # Startup: optionally launch periodic cleanup in background
     cleanup_task = None
     if os.getenv("DISABLE_CLEANUP", "").strip() != "1":
         cleanup_task = asyncio.create_task(periodic_cleanup())
         logger.info("Periodic cleanup task started")
+    
     try:
         yield
     finally:
@@ -395,20 +420,46 @@ app = FastAPI(title="Turbo Alan Refiner API", version="3.0.0", lifespan=lifespan
 database_initialized = False
 
 # Global exception handlers for standardized errors
+from core.exceptions import RefinerException, ValidationError as RefinerValidationError
+
+# Import route modules
+from api.routes.analytics import router as analytics_router
+from api.routes.jobs import router as jobs_router
+from api.routes.settings import router as settings_router
+from api.routes.schema import router as schema_router
+
+@app.exception_handler(RefinerException)
+async def refiner_exception_handler(request: Request, exc: RefinerException):
+    """Handle custom RefinerException instances with proper error responses."""
+    logger.warning(f"RefinerException: {exc.message} (code: {exc.error_code})")
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=exc.to_dict()
+    )
+
 @app.exception_handler(APIError)
 async def api_error_handler(request: Request, exc: APIError):
+    """Handle legacy APIError instances for backward compatibility."""
     logger.warning(f"APIError: {exc.message}")
     return create_error_response(exc.message, exc.status_code, exc.error_code, exc.details)
 
 @app.exception_handler(RequestValidationError)
 async def validation_error_handler(request: Request, exc: RequestValidationError):
-    # Mirror FastAPI structure but standardized
+    """Handle FastAPI request validation errors."""
     details = exc.errors()
-    return create_error_response("Validation error", 422, "REQUEST_VALIDATION_ERROR", {"detail": details})
+    validation_exc = RefinerValidationError(
+        message="Request validation failed",
+        details={"validation_errors": details}
+    )
+    return JSONResponse(
+        status_code=validation_exc.status_code,
+        content=validation_exc.to_dict()
+    )
 
 @app.exception_handler(Exception)
 async def unhandled_error_handler(request: Request, exc: Exception):
-    logger.error(f"Unhandled error: {exc}")
+    """Handle unhandled exceptions with proper logging."""
+    logger.error(f"Unhandled error: {exc}", exc_info=True)
     return create_error_response("Internal server error", 500, "INTERNAL_ERROR")
 
 # Ensure DB tables exist
@@ -699,15 +750,12 @@ class RefinementRequest(BaseModel):
             if self.output_settings.get("type") not in ("local", "drive"):
                 self.output_settings["type"] = "local"
             if self.output_settings.get("type") == "local":
-                default_output = _get_output_dir()
-                path = self.output_settings.get("path") or self.output_settings.get("dir") or default_output
+                path = self.output_settings.get("path") or self.output_settings.get("dir")
                 if not isinstance(path, str):
-                    path = default_output
-                # sanitize - ensure path is within backend directory
-                backend_dir = _get_backend_dir()
-                if ".." in path or (os.path.isabs(path) and not path.startswith(backend_dir)):
-                    path = default_output
-                self.output_settings["path"] = path
+                    path = str(get_output_dir())
+                # Sanitize path to ensure it's within backend directory
+                sanitized_path = sanitize_path(path, base_dir=get_backend_root())
+                self.output_settings["path"] = str(sanitized_path)
         except Exception:
             # Never fail constructor; rely on endpoint logic to handle deeper errors
             pass
@@ -759,6 +807,12 @@ _model = None
 _global_lock = threading.RLock()  # Use RLock to allow reentrant calls
 
 def get_settings() -> Settings:
+    """
+    Get application settings instance.
+    
+    Returns:
+        Settings instance with current configuration
+    """
     global _settings
     if _settings is None:
         with _global_lock:
@@ -776,6 +830,15 @@ def get_model() -> OpenAIModel:
     return _model
 
 def get_pipeline() -> RefinementPipeline:
+    """
+    Get or create the refinement pipeline instance (singleton).
+    
+    Returns:
+        RefinementPipeline instance
+        
+    Raises:
+        ConfigurationError: If pipeline cannot be initialized
+    """
     global _pipeline
     if _pipeline is None:
         with _global_lock:
@@ -1009,7 +1072,7 @@ async def cleanup_stale_tasks():
                 safe_upsert_job(job_id, {"status": "failed", "error": "Task became stale"})
             
             if stale_tasks:
-                print(f"Cleaned up {len(stale_tasks)} stale background tasks")
+                logger.info(f"Cleaned up {len(stale_tasks)} stale background tasks")
                 
     except Exception as e:
         from logger import log_exception
@@ -1017,17 +1080,6 @@ async def cleanup_stale_tasks():
 
 # Job storage for analytics (in production, use proper database)
 _jobs_storage: Dict[str, Dict[str, Any]] = {}
-
-@app.get("/")
-async def root() -> Dict[str, Any]:
-    """Root endpoint to show server is running."""
-    return {
-        "message": "Turbo Alan Refiner API Server is running",
-        "version": "3.0.0",
-        "status": "online",
-        "docs": "/docs",
-        "health": "/health"
-    }
 
 @app.get("/health")
 async def health() -> Dict[str, Any]:
@@ -1136,6 +1188,12 @@ async def job_status(job_id: str) -> Dict[str, Any]:
 @app.get("/jobs")
 async def jobs_list() -> Dict[str, Any]:
     return {"jobs": list_jobs(100)}
+
+# Include route modules
+app.include_router(analytics_router)
+app.include_router(jobs_router)
+app.include_router(settings_router)
+app.include_router(schema_router)
 
 # Mount websocket router (optional)
 try:
@@ -1389,63 +1447,6 @@ async def download_file(request: FileDownloadRequest):
         from logger import log_exception
         log_exception("FILE_DOWNLOAD_ERROR", e)
         raise HTTPException(500, f"File download failed: {str(e)}")
-
-# Serve files by path from output directory (for Vercel/serverless environments)
-@app.get("/files/serve")
-@handle_api_error
-async def serve_file_by_path(file_path: str):
-    """Serve a file by its path from the output directory."""
-    try:
-        # Security: Only allow files from output directory
-        output_dir = _get_output_dir()
-        
-        # Resolve the file path
-        if os.path.isabs(file_path):
-            resolved_path = file_path
-        else:
-            # If relative, resolve relative to output directory
-            resolved_path = os.path.join(output_dir, file_path)
-        
-        # Normalize path and ensure it's within output directory
-        resolved_path = os.path.abspath(os.path.normpath(resolved_path))
-        
-        # Security check: ensure path is within output directory
-        if not resolved_path.startswith(os.path.abspath(output_dir)):
-            raise APIError("Access denied: file path outside output directory", 403, "ACCESS_DENIED")
-        
-        # Check if file exists
-        if not os.path.exists(resolved_path) or not os.path.isfile(resolved_path):
-            raise APIError(f"File not found: {os.path.basename(resolved_path)}", 404, "FILE_NOT_FOUND")
-        
-        # Determine content type
-        ext = os.path.splitext(resolved_path)[1].lower()
-        content_type_map = {
-            '.txt': 'text/plain; charset=utf-8',
-            '.md': 'text/markdown; charset=utf-8',
-            '.json': 'application/json; charset=utf-8',
-            '.pdf': 'application/pdf',
-            '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-        }
-        content_type = content_type_map.get(ext, 'application/octet-stream')
-        
-        # Get filename for Content-Disposition
-        filename = os.path.basename(resolved_path)
-        
-        # Return file as streaming response
-        return StreamingResponse(
-            open(resolved_path, 'rb'),
-            media_type=content_type,
-            headers={
-                "Content-Disposition": f'attachment; filename="{filename}"',
-                "Cache-Control": "no-cache, no-store, must-revalidate",
-            }
-        )
-    except APIError:
-        raise
-    except Exception as e:
-        from logger import log_exception
-        log_exception("FILE_SERVE_ERROR", e)
-        raise HTTPException(500, f"File serve failed: {str(e)}")
 
 # Google Drive integration
 @app.post("/files/drive/upload")
@@ -1889,20 +1890,13 @@ async def _refine_stream(request: RefinementRequest, job_id: str) -> AsyncGenera
                 
                 output_sink = None
                 if request.output_settings.get("type") == "local":
-                    default_output = _get_output_dir()  # Always use backend/data/output
-                    output_path = request.output_settings.get("path", default_output)
-                    # Ensure we always use an absolute path
-                    if not os.path.isabs(output_path):
-                        # If relative path like "./output", always use the default backend/data/output
-                        # This prevents files from being saved to legacy backend/output/ directory
-                        output_path = default_output
-                    # Normalize the path to handle any .. or . components
-                    output_path = os.path.abspath(os.path.normpath(output_path))
-                    # Final check: ensure it's within backend directory for security
-                    backend_dir = _get_backend_dir()
-                    if not output_path.startswith(backend_dir):
-                        output_path = default_output
-                    output_sink = LocalSink(output_path)
+                    # Use centralized path configuration with sanitization
+                    output_path_env = request.output_settings.get("path")
+                    output_path = sanitize_path(
+                        output_path_env if output_path_env else "",
+                        base_dir=get_backend_root()
+                    )
+                    output_sink = LocalSink(str(output_path))
                 elif request.output_settings.get("type") == "drive":
                     try:
                         output_sink = DriveSink(request.output_settings.get("folder_id"), get_google_credentials())
@@ -2453,7 +2447,7 @@ async def delete_file(file_id: str):
 
 @app.get("/analytics/jobs")
 async def analytics_jobs() -> Dict[str, Any]:
-    return {"jobs": db_list_jobs(200)}
+    return {"jobs": list_jobs(200)}
 
 @app.get("/logs")
 async def read_logs(lines: int = 200) -> Dict[str, Any]:
@@ -2499,35 +2493,28 @@ async def list_drive_files(request: DriveFileRequest = Depends()):
         credentials_file = os.path.join(backend_dir, 'config', 'credentials.json')
         token_file = os.path.join(backend_dir, 'config', 'token.json')
         
-        # Check for credentials via environment variable or file
-        google_creds_json = os.getenv('GOOGLE_CREDENTIALS_JSON')
-        has_env_creds = bool(google_creds_json)
-        has_file_creds = os.path.exists(service_account_file) or os.path.exists(credentials_file)
-        
-        if not has_env_creds and not has_file_creds:
+        if not os.path.exists(service_account_file) and not os.path.exists(credentials_file):
             raise HTTPException(
                 status_code=500,
-                detail="Google Drive credentials not configured. Please set GOOGLE_CREDENTIALS_JSON environment variable or set up credential files in backend/config/. See backend/config/ for credential files."
+                detail="Google Drive credentials not configured. Please set up Google Drive authentication. See backend/config/ for credential files."
             )
         
-        try:
-            creds = get_google_credentials()
-            if not creds:
+        creds = get_google_credentials()
+        if not creds:
+            # Check if credentials file exists
+            backend_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            creds_file = os.path.join(backend_dir, 'config', 'google_credentials.json')
+            
+            if os.path.exists(creds_file):
                 raise HTTPException(
                     status_code=500,
-                    detail="Google Drive not authenticated. Please check your credentials configuration."
+                    detail="Google Drive credentials file exists but is invalid. The service account key may have been regenerated. Please regenerate the key in Google Cloud Console and replace config/google_credentials.json. See backend/FIX_INVALID_JWT_SIGNATURE.md for instructions."
                 )
-        except Exception as e:
-            error_detail = str(e)
-            if "Invalid JWT Signature" in error_detail or "invalid_grant" in error_detail:
+            else:
                 raise HTTPException(
                     status_code=500,
-                    detail=f"Invalid Google Drive credentials: {error_detail}. Please verify your GOOGLE_CREDENTIALS_JSON environment variable has correct private_key with proper newlines."
+                    detail="Google Drive credentials not configured. Please set up Google Drive authentication. See backend/config/ for credential files or backend/FIX_INVALID_JWT_SIGNATURE.md for setup instructions."
                 )
-            raise HTTPException(
-                status_code=500,
-                detail=f"Failed to load Google Drive credentials: {error_detail}"
-            )
         
         service = get_drive_service_oauth()
         if not service:
@@ -2750,52 +2737,21 @@ async def list_drive_folders():
 async def authenticate_drive():
     """Check Drive authentication status"""
     try:
-        # Check if credentials are available
-        google_creds_json = os.getenv('GOOGLE_CREDENTIALS_JSON')
-        backend_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        service_account_file = os.path.join(backend_dir, 'config', 'google_credentials.json')
-        credentials_file = os.path.join(backend_dir, 'config', 'credentials.json')
-        
-        has_env_creds = bool(google_creds_json)
-        has_file_creds = os.path.exists(service_account_file) or os.path.exists(credentials_file)
-        
         creds = get_google_credentials()
-        if creds:
-            # Try to refresh to validate
-            try:
-                if not creds.valid:
-                    if creds.expired and hasattr(creds, 'refresh'):
-                        from google.auth.transport.requests import Request
-                        creds.refresh(Request())
-                return {
-                    "authenticated": True,
-                    "message": "Google Drive is authenticated and ready",
-                    "has_env_creds": has_env_creds,
-                    "has_file_creds": has_file_creds,
-                    "client_email": getattr(creds, 'service_account_email', None) or getattr(creds, 'client_email', None)
-                }
-            except Exception as refresh_error:
-                return {
-                    "authenticated": False,
-                    "message": f"Credentials found but validation failed: {str(refresh_error)}",
-                    "has_env_creds": has_env_creds,
-                    "has_file_creds": has_file_creds,
-                    "error": str(refresh_error)
-                }
+        if creds and creds.valid:
+            return {
+                "authenticated": True,
+                "message": "Google Drive is authenticated and ready"
+            }
         else:
             return {
                 "authenticated": False,
-                "message": "Google Drive authentication required. Please set GOOGLE_CREDENTIALS_JSON environment variable or configure credential files.",
-                "has_env_creds": has_env_creds,
-                "has_file_creds": has_file_creds
+                "message": "Google Drive authentication required. Please run desktop app to authenticate."
             }
     except Exception as e:
-        import traceback
         return {
             "authenticated": False,
-            "message": f"Authentication check failed: {str(e)}",
-            "error": str(e),
-            "traceback": traceback.format_exc() if os.getenv('DEBUG') == 'true' else None
+            "message": f"Authentication check failed: {str(e)}"
         }
 
 # =============================================================================
@@ -3554,7 +3510,9 @@ class DiffRequest(BaseModel):
 @app.get("/analytics/summary")
 async def get_analytics_summary():
     """Get comprehensive analytics summary, including live OpenAI usage."""
+    logger = logging.getLogger(__name__)
     try:
+        logger.debug(f"Analytics endpoint called: requests={analytics_store.total_requests}, cost=${analytics_store.total_cost:.6f}")
         # Get all jobs from database
         jobs = list_jobs(1000)  # Get last 1000 jobs
         
@@ -3583,7 +3541,7 @@ async def get_analytics_summary():
         # Recent activity (last 10 jobs)
         recent_activity = sorted(jobs, key=lambda x: x.get("created_at", 0), reverse=True)[:10]
         
-        return JSONResponse({
+        result = {
             "jobs": {
                 "totalJobs": total_jobs,
                 "completed": len(completed_jobs),
@@ -3616,10 +3574,33 @@ async def get_analytics_summary():
                 "last_24h": analytics_store.summary_last_24h(),
             },
             "schema_usage": analytics_store.get_schema_usage_stats()
-        })
+        }
+        logger.debug(f"Returning analytics: requests={result['openai']['total_requests']}, cost=${result['openai']['total_cost']:.6f}")
+        return JSONResponse(result)
     except Exception as e:
         from logger import log_exception
         log_exception("ANALYTICS_SUMMARY_ERROR", e)
+        logger.error(f"Analytics summary error: {e}", exc_info=True)
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+@app.get("/analytics/test")
+async def test_analytics():
+    """Test endpoint to verify analytics tracking works"""
+    try:
+        # Manually add some test data
+        test_cost = analytics_store.add(100, 50, "gpt-4", "test-job-123")
+        return JSONResponse({
+            "message": "Test analytics added",
+            "analytics_store": {
+                "total_requests": analytics_store.total_requests,
+                "total_tokens_in": analytics_store.total_tokens_in,
+                "total_tokens_out": analytics_store.total_tokens_out,
+                "total_cost": analytics_store.total_cost,
+                "current_model": analytics_store.current_model,
+            },
+            "test_cost": test_cost
+        })
+    except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
 @app.get("/refine/diff")

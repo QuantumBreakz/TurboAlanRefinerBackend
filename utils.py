@@ -39,6 +39,7 @@ import time
 import random
 import os
 import json as _json
+import base64
 
 # PDF and DOC support
 try:
@@ -98,825 +99,874 @@ def _get_style_by_name(doc: Document, key: str):
     name = _canon_style_name(key)
 
     # First, try explicit name match (avoids deprecated style_id lookup)
-    for st in doc.styles:
-        try:
-            if getattr(st, "name", None) == name:
-                return st
-        except Exception:
-            continue
+    for style in doc.styles:
+        if style.name == name:
+            return style
 
-    # Fallback: silence docx's deprecated style_id lookup warning
-    import warnings
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", UserWarning)
-        return doc.styles[name]
+    # Fallback: try to create if missing (only for Normal)
+    if name == "Normal":
+        return doc.styles["Normal"]
 
-    # If nothing works, raise explicit error
-    raise KeyError(f"Style not found by name: {name}")
+    return None
 
-# ----------------
-# Heuristics YAML
-# ----------------
+# ---------------------------
+# Heading detection and mapping
+# ---------------------------
 
-def load_heuristics(path: str = None) -> dict:
-    """Load heuristics YAML. Resolves relative to backend/config if not found in CWD.
+def _is_heading_paragraph(para):
+    """Detect if a paragraph is a heading based on style properties."""
+    style = para.style
+    style_name = style.name if style else ""
 
-    Search order:
-      1) Given absolute path (as-is)
-      2) Relative path from current working directory
-      3) Relative path from backend/config/ directory
+    # Check style name
+    if "Heading" in style_name or style_name.startswith("Heading "):
+        return True
+
+    # Check outline level
+    if hasattr(para, "paragraph_format") and para.paragraph_format.outline_level:
+        return True
+
+    # Check formatting (bold + larger size often indicates heading)
+    runs = para.runs
+    if runs:
+        first_run = runs[0]
+        if first_run.bold:
+            font_size = first_run.font.size
+            if font_size and font_size.pt > 12:  # Larger than normal text
+                return True
+
+    return False
+
+def _extract_headings_from_doc(doc: Document) -> List[Tuple[str, int]]:
     """
-    if path is None:
-        path = "heuristics.yaml"
-    
-    candidates = []
-    if os.path.isabs(path):
-        candidates.append(path)
-    else:
-        # CWD
-        candidates.append(os.path.abspath(path))
-        # Backend config directory (utils.py is in backend/, so dirname(__file__) gives backend/)
-        backend_dir = os.path.dirname(os.path.abspath(__file__))
-        config_path = os.path.join(backend_dir, 'config', path)
-        candidates.append(config_path)
-
-    for p in candidates:
-        try:
-            if os.path.exists(p):
-                with open(p, 'r', encoding='utf-8') as f:
-                    return yaml.safe_load(f)
-        except Exception:
-            continue
-    raise FileNotFoundError(f"Heuristics YAML not found. Tried: {candidates}")
-
-# ------------------------------
-# History analysis (MVP profile)
-# ------------------------------
-
-def derive_history_profile(history_path: str = None, max_entries: int = 50) -> Dict[str, float]:
-    """Compute a lightweight session profile from recent history and logs.
-
-    Returns a dict with normalized hints in 0..1 range:
-      - brevity_bias: tendency to shorten content
-      - formality_bias: tendency to prefer formal tone
-      - structure_bias: tendency to add headings/separators
+    Extract headings from document with their levels.
+    Returns list of (heading_text, level) tuples.
     """
-    if history_path is None:
-        backend_dir = os.path.dirname(os.path.dirname(__file__))
-        history_path = os.path.join(backend_dir, 'data', 'recent_history.json')
-    
-    profile = {"brevity_bias": 0.5, "formality_bias": 0.5, "structure_bias": 0.5}
-    try:
-        # Look at logs/refiner.log for PASS_TOGGLES signals
-        backend_dir = os.path.dirname(os.path.dirname(__file__))
-        log_path = os.path.join(backend_dir, 'logs', 'refiner.log')
-        changes: List[float] = []
-        redundants: List[int] = []
-        with open(log_path, 'r', encoding='utf-8') as f:
-            lines = f.readlines()[-max_entries:]
-        for ln in lines:
-            if 'PASS_TOGGLES' in ln:
-                # extract edits_per_100w and sentences vs prev
-                try:
-                    # crude parse of key=value tokens
-                    tokens = dict(
-                        (kv.split('=')[0], kv.split('=')[1])
-                        for kv in (seg.strip() for seg in ln.split() if '=' in seg)
-                    )
-                    edits = float(tokens.get('edits_per_100w', '0'))
-                    sents = float(tokens.get('sentences', '0'))
-                    sents_prev = float(tokens.get('sentences_prev', '0'))
-                    changes.append(edits)
-                    if sents_prev > 0 and sents < sents_prev:
-                        redundants.append(1)
-                except Exception:
-                    continue
-        # Normalize simple tendencies
-        if changes:
-            # Higher edits/100w => higher brevity/structure pressure
-            avg_edits = sum(changes) / max(1.0, float(len(changes)))
-            profile["brevity_bias"] = max(0.0, min(1.0, avg_edits / 40.0))
-            profile["structure_bias"] = max(0.0, min(1.0, avg_edits / 50.0))
-        if redundants:
-            profile["structure_bias"] = max(profile["structure_bias"], 0.6)
-
-        # Peek recent_history.json for any user choices (placeholder hook)
-        try:
-            if not os.path.isabs(history_path):
-                backend_dir = os.path.dirname(os.path.dirname(__file__))
-                hist_full = os.path.join(backend_dir, 'data', os.path.basename(history_path))
-            else:
-                hist_full = history_path
-            if os.path.exists(hist_full):
-                with open(hist_full, 'r', encoding='utf-8') as hf:
-                    _json.load(hf)
-        except Exception:
-            pass
-    except Exception:
-        pass
-    return profile
-
-# ----------------------
-# Reader (robust H1‑H3)
-# ----------------------
-
-def read_text_from_file(file_path: str) -> str:
-    # Guard: explicit existence check with clear error for callers/GUI
-    if not os.path.exists(file_path):
-        raise FileNotFoundError(f"Input file does not exist: {file_path}")
-    lower = file_path.lower()
-    if lower.endswith('.txt') or lower.endswith('.md'):
-        with open(file_path, 'r', encoding='utf-8') as f:
-            return f.read()
-    elif lower.endswith('.pdf'):
-        return _extract_text_from_pdf(file_path)
-    elif lower.endswith('.doc'):
-        return _extract_text_from_doc(file_path)
-    elif lower.endswith('.docx'):
-        pass  # Continue with existing DOCX logic
-    else:
-        raise ValueError(f"Unsupported file type: {file_path}")
-
-    doc = Document(file_path)
-
-    def run_size_pt(run) -> float | None:
-        sz = getattr(getattr(run, 'font', None), 'size', None)
-        if sz:
-            try:
-                return float(sz.pt)
-            except Exception:
-                pass
-        try:
-            rPr = run._element.rPr
-            if rPr is not None and getattr(rPr, 'sz', None) is not None and rPr.sz.val is not None:
-                return float(rPr.sz.val) / 2.0
-        except Exception:
-            pass
-        return None
-
-    def paragraph_heading_level(p) -> int:
-        name = getattr(getattr(p, 'style', None), 'name', '') or ''
-        m = re.search(r'heading\s*(\d)', name, flags=re.IGNORECASE)
-        if m:
-            try:
-                return min(int(m.group(1)), 6)
-            except ValueError:
-                pass
-        lname = name.lower()
-        if lname == 'title':
-            return 1
-        if lname in ('subtitle', 'sub-title', 'sub title'):
-            return 2
-        try:
-            ppr = p._element.pPr
-            if ppr is not None and getattr(ppr, 'outlineLvl', None) is not None and ppr.outlineLvl.val is not None:
-                return min(int(ppr.outlineLvl.val) + 1, 6)
-        except Exception:
-            pass
-        for r in p.runs:
-            try:
-                rstyle = getattr(getattr(r, 'style', None), 'name', '') or ''
-                m2 = re.search(r'heading\s*(\d)', rstyle, flags=re.IGNORECASE)
-                if m2:
-                    return min(int(m2.group(1)), 6)
-            except Exception:
-                pass
-        sizes = []
-        any_bold = False
-        has_text = False
-        for r in p.runs:
-            if (r.text or '').strip():
-                has_text = True
-                s = run_size_pt(r)
-                if s:
-                    sizes.append(s)
-                b = getattr(getattr(r, 'font', None), 'bold', None)
-                any_bold = any_bold or bool(b) if b is not None else any_bold
-        if has_text and sizes:
-            import statistics
-            try:
-                size_pt = statistics.median(sizes)
-            except Exception:
-                size_pt = sizes[0]
-            def approx(val, target, tol=0.6):
-                return abs(val - target) <= tol
-            if approx(size_pt, 20.0) and not any_bold:
-                return 1
-            if approx(size_pt, 16.0) and not any_bold:
-                return 2
-            if approx(size_pt, 14.0) and any_bold:
-                return 3
-        return 0
-
-    lines: List[str] = []
-
-    def walk(el) -> None:
-        if hasattr(el, 'paragraphs'):
-            for p in el.paragraphs:
-                text = p.text or ''
-                lvl = paragraph_heading_level(p)
-                if lvl > 0:
-                    lines.append('#' * lvl + ' ' + text)
+    headings = []
+    for para in doc.paragraphs:
+        if _is_heading_paragraph(para):
+            text = para.text.strip()
+            if text:
+                # Determine level from style name
+                style_name = para.style.name if para.style else ""
+                level = 1
+                if "Heading 1" in style_name or "Heading1" in style_name:
+                    level = 1
+                elif "Heading 2" in style_name or "Heading2" in style_name:
+                    level = 2
+                elif "Heading 3" in style_name or "Heading3" in style_name:
+                    level = 3
+                elif "Heading 4" in style_name or "Heading4" in style_name:
+                    level = 4
+                elif "Heading 5" in style_name or "Heading5" in style_name:
+                    level = 5
+                elif "Heading 6" in style_name or "Heading6" in style_name:
+                    level = 6
                 else:
-                    lines.append(text)
-        if hasattr(el, 'tables'):
-            for t in el.tables:
-                for row in t.rows:
-                    for cell in row.cells:
-                        walk(cell)
+                    # Try outline level
+                    if hasattr(para, "paragraph_format"):
+                        outline_level = para.paragraph_format.outline_level
+                        if outline_level:
+                            level = outline_level
 
-    walk(doc)
-    return '\n'.join(lines)
+                headings.append((text, level))
+    return headings
 
-# -------------------------
-# Skeleton + seq from DOCX
-# -------------------------
-
-StyleRecord = Dict[str, object]
-StyleSkeleton = Dict[str, StyleRecord]
-
-_DEF_SKEL: StyleSkeleton = {
-    "Normal":    {"font_name":"Arial","font_size_pt":11,"bold":False,"color_rgb":(0,0,0),
-                  "space_before_pt":0,"space_after_pt":12,"line_spacing":1.0},
-    "Heading 1": {"font_name":"Arial","font_size_pt":20,"bold":False,"color_rgb":(0,0,0),
-                  "space_before_pt":12,"space_after_pt":12,"line_spacing":1.0},
-    "Heading 2": {"font_name":"Arial","font_size_pt":16,"bold":False,"color_rgb":(0,0,0),
-                  "space_before_pt":12,"space_after_pt":6,"line_spacing":1.0},
-    "Heading 3": {"font_name":"Arial","font_size_pt":14,"bold":True ,"color_rgb":(0,0,0),
-                  "space_before_pt":6,"space_after_pt":6,"line_spacing":1.0},
-}
-
-def _extract_style_record(doc: Document, style_name: str) -> StyleRecord:
-    rec: StyleRecord = dict(_DEF_SKEL.get(style_name, {}))
-    try:
-        st = _get_style_by_name(doc, style_name)
-    except KeyError:
-        return rec
-    if hasattr(st, 'font'):
-        if st.font.name:
-            rec['font_name'] = st.font.name
-        if st.font.size:
-            rec['font_size_pt'] = int(st.font.size.pt)
-        if st.font.bold is not None:
-            rec['bold'] = bool(st.font.bold)
-        if st.font.color and st.font.color.rgb:
-            rgb = st.font.color.rgb
-            rec['color_rgb'] = (rgb[0], rgb[1], rgb[2])
-    if hasattr(st, 'paragraph_format'):
-        pf = st.paragraph_format
-        if pf.space_before:
-            rec['space_before_pt'] = int(pf.space_before.pt)
-        if pf.space_after:
-            rec['space_after_pt'] = int(pf.space_after.pt)
-        if pf.line_spacing:
-            try:
-                rec['line_spacing'] = float(pf.line_spacing)
-            except Exception:
-                pass
-    return rec
-
-def make_style_skeleton_from_docx(source_docx_path: str) -> StyleSkeleton:
-    doc = Document(source_docx_path)
-    skel: StyleSkeleton = {k: dict(v) for k, v in _DEF_SKEL.items()}
-    for sname in ("Normal", "Heading 1", "Heading 2", "Heading 3"):
-        src = _extract_style_record(doc, sname)
-        for k, v in src.items():
-            if v is not None:
-                skel[sname][k] = v
-    return skel
-
-def _apply_style_defaults(doc: Document, style_name: str, rec: StyleRecord) -> None:
-    try:
-        st = _get_style_by_name(doc, style_name)
-    except KeyError:
-        return
-    st.font.name = rec['font_name']
-    if hasattr(st, '_element') and hasattr(st._element, 'rPr') and st._element.rPr is not None:
-        st._element.rPr.rFonts.set(qn('w:eastAsia'), rec['font_name'])
-    from docx.shared import Pt as _Pt
-    st.font.size = _Pt(rec['font_size_pt'])
-    st.font.bold = bool(rec.get('bold', False))
-    r, g, b = rec['color_rgb']
-    st.font.color.rgb = RGBColor(int(r), int(g), int(b))
-    pf = st.paragraph_format
-    pf.space_before = _Pt(rec['space_before_pt'])
-    pf.space_after  = _Pt(rec['space_after_pt'])
-    pf.line_spacing = rec['line_spacing']
-
-def _set_paragraph_format(p, rec: StyleRecord) -> None:
-    from docx.shared import Pt as _Pt
-    pf = p.paragraph_format
-    pf.space_before = _Pt(rec['space_before_pt'])
-    pf.space_after  = _Pt(rec['space_after_pt'])
-    pf.line_spacing = rec['line_spacing']
-
-# ---------------------------------------------
-# Structure‑aware heading target selection
-# ---------------------------------------------
-
-def _heading_counts_from_seq(seq: List[str]) -> Tuple[int, int, int]:
-    return (seq.count('Heading 1'), seq.count('Heading 2'), seq.count('Heading 3'))
-
-_TITLEY_RE = re.compile(r"^(?:[A-Z][\w\-']+\s+){1,12}[A-Za-z0-9\-']{1,}$")
-_PUNCTUATION_END = re.compile(r"[.!?…]$")
-
-
-def _score_heading_candidate(line: str) -> float:
-    """Higher score => more heading‑like.
-    Heuristics: shortish line, not ending with period, title‑case ratio, no leading bullet.
+def _map_headings_to_refined_text(source_headings: List[Tuple[str, int]], refined_text: str) -> Dict[int, str]:
     """
-    s = line.strip()
-    if not s:
-        return 0.0
-    if s[:2] in ("- ", "• ", "* "):
-        return 0.0
-    length = len(s)
-    if length > 120:
-        return 0.0
-    # Avoid sentences that look like body text (end with period/question/ellipsis)
-    if _PUNCTUATION_END.search(s):
-        body_penalty = 0.25
-    else:
-        body_penalty = 0.0
-    # Title‑case ratio
-    words = [w for w in re.split(r"\s+", s) if w]
-    caps = sum(1 for w in words if w[:1].isupper())
-    ratio = (caps / max(1, len(words)))
-    title_bonus = ratio * 0.6
-    # Ultra short/long shaping
-    length_bonus = 0.4 if 8 <= length <= 80 else 0.1 if length < 8 else 0.0
-    return max(0.0, title_bonus + length_bonus - body_penalty)
-
-
-def _pick_heading_targets(lines: List[str], want_h1: int, want_h2: int, want_h3: int) -> Dict[int, str]:
-    """Return a map {line_index: style_name} choosing heading‑like lines in order.
-    Priority:
-      1) Explicit markers '# ', '## ', '### '
-      2) Top‑scoring title‑like lines in reading order
-    Count of each level matches source counts; extra markers beyond source caps are downgraded to Normal.
+    Map source headings to refined text by finding best matches.
+    Returns dict mapping level -> heading_text for refined text.
     """
-    n = len(lines)
-    assigned: Dict[int, str] = {}
+    # Split refined text into paragraphs
+    refined_paras = [p.strip() for p in refined_text.split("\n") if p.strip()]
 
-    # 1) Collect explicit markers
-    explicit_h1 = [i for i,l in enumerate(lines) if l.startswith('# ')]
-    explicit_h2 = [i for i,l in enumerate(lines) if l.startswith('## ')]
-    explicit_h3 = [i for i,l in enumerate(lines) if l.startswith('### ')]
+    # Find heading candidates in refined text (lines that look like headings)
+    heading_candidates = []
+    for i, para in enumerate(refined_paras):
+        # Check if it looks like a heading (starts with #, or is short and bold-looking)
+        if para.startswith("#"):
+            # Markdown heading
+            level = len(para) - len(para.lstrip("#"))
+            text = para.lstrip("#").strip()
+            heading_candidates.append((i, text, level))
+        elif len(para) < 100 and para.isupper():  # Short uppercase line might be heading
+            heading_candidates.append((i, para, 1))
 
-    def take_first_k(idxs: List[int], k: int) -> List[int]:
-        out = []
-        for i in idxs:
-            if len(out) >= k: break
-            out.append(i)
-        return out
+    # Map source headings to candidates in order
+    mapped = {}
+    candidate_idx = 0
+    for source_text, source_level in source_headings:
+        # Find best matching candidate
+        best_match = None
+        best_score = 0
+        for i, (cand_idx, cand_text, cand_level) in enumerate(heading_candidates[candidate_idx:], start=candidate_idx):
+            # Score based on text similarity and level match
+            text_similarity = len(set(source_text.lower().split()) & set(cand_text.lower().split())) / max(len(source_text.split()), 1)
+            level_match = 1.0 if cand_level == source_level else 0.5
+            score = text_similarity * 0.7 + level_match * 0.3
 
-    mark_h1 = take_first_k(explicit_h1, want_h1)
-    mark_h2 = take_first_k(explicit_h2, want_h2)
-    mark_h3 = take_first_k(explicit_h3, want_h3)
+            if score > best_score:
+                best_score = score
+                best_match = (cand_idx, cand_text, cand_level)
 
-    for i in mark_h1: assigned[i] = 'Heading 1'
-    for i in mark_h2: assigned[i] = 'Heading 2'
-    for i in mark_h3: assigned[i] = 'Heading 3'
-
-    # remaining counts to fill via candidates
-    left_h1 = max(0, want_h1 - len(mark_h1))
-    left_h2 = max(0, want_h2 - len(mark_h2))
-    left_h3 = max(0, want_h3 - len(mark_h3))
-
-    if left_h1 + left_h2 + left_h3 == 0:
-        return assigned
-
-    # 2) Score candidates (skip already assigned and blank lines)
-    scored: List[Tuple[int, float]] = []
-    for i, l in enumerate(lines):
-        if i in assigned: 
-            continue
-        if not l.strip():
-            continue
-        # If line starts with a marker but we don't need more of that level, treat as body
-        if l.startswith('#'):
-            continue
-        scored.append((i, _score_heading_candidate(l)))
-
-    # Keep only reasonably title‑like lines
-    scored = [(i,s) for (i,s) in scored if s >= 0.35]
-    scored.sort(key=lambda t: (t[0], -t[1]))  # reading order, tie‑break by score
-
-    # Assign in reading order: fill H1, then H2s, then H3s
-    for i,_ in scored:
-        if left_h1 > 0:
-            assigned[i] = 'Heading 1'; left_h1 -= 1; continue
-        if left_h2 > 0:
-            assigned[i] = 'Heading 2'; left_h2 -= 1; continue
-        if left_h3 > 0:
-            assigned[i] = 'Heading 3'; left_h3 -= 1; continue
-        if left_h1 + left_h2 + left_h3 == 0:
-            break
-
-    return assigned
-
-# ----------------------------
-# Writer (structure‑aware map)
-# ----------------------------
-
-def write_docx_with_skeleton(text: str, out_path: str, skel: Dict[str, Dict[str, object]], seq: List[str] | None) -> None:
-    doc = Document()
-    for s in ("Normal", "Heading 1", "Heading 2", "Heading 3"):
-        _apply_style_defaults(doc, s, skel[s])
-
-    lines = text.splitlines()
-
-    # Derive desired counts from source sequence
-    want_h1, want_h2, want_h3 = _heading_counts_from_seq(seq or [])
-
-    # Build structure‑aware target map
-    targets = _pick_heading_targets(lines, want_h1, want_h2, want_h3)
-
-    for i, raw in enumerate(lines):
-        line = raw if raw is not None else ""
-        # Strip explicit markers, but they still influence assignment
-        if line.startswith('### '):
-            content = line[4:]
-            style = targets.get(i, 'Heading 3' if want_h3 else 'Normal')
-        elif line.startswith('## '):
-            content = line[3:]
-            style = targets.get(i, 'Heading 2' if want_h2 else 'Normal')
-        elif line.startswith('# '):
-            content = line[2:]
-            style = targets.get(i, 'Heading 1' if want_h1 else 'Normal')
+        if best_match and best_score > 0.3:  # Threshold for matching
+            mapped[best_match[2]] = best_match[1]
+            candidate_idx = heading_candidates.index(best_match) + 1
         else:
-            content = line
-            style = targets.get(i, 'Normal')
+            # No good match, use source heading as-is
+            mapped[source_level] = source_text
 
-        p = doc.add_paragraph(content, style=style)
-        _set_paragraph_format(p, skel[style if style in skel else 'Normal'])
-
-    doc.save(out_path)
+    return mapped
 
 # ---------------------------
-# write_text_to_file (DOCX)
+# Main mapping function
 # ---------------------------
 
-def write_text_to_file(output_dir: str, base_name: str, ext: str, text: str,
-                       original_file: str, iteration: int) -> str:
-    # Normalize base name: avoid double pass suffixes like _pass2_pass1
-    try:
-        # Remove one or more trailing _pass<digits> groups (e.g., _pass2_pass3)
-        base_clean = re.sub(r"(?:_pass\d+)+$", "", base_name, flags=re.IGNORECASE)
-    except Exception:
-        base_clean = base_name
-    suffix = ext if ext.startswith('.') else f'.{ext}'
-    filename = f"{base_clean}_pass{iteration}{suffix}"
-    # Create an isolated, unique temp subdirectory per write to avoid collisions in batch runs
-    # Keep stable basename for downstream move/upload while isolating the directory
-    temp_dir = tempfile.mkdtemp(prefix=f"refiner_{base_name}_")
-    local_path = os.path.join(temp_dir, filename)
+def map_headings_to_refined_doc(source_doc_path: str, refined_doc_path: str, output_path: str):
+    """
+    Map headings from source document to refined document, preserving structure.
+    """
+    source_doc = Document(source_doc_path)
+    refined_doc = Document(refined_doc_path)
 
-    if suffix in ['.txt', '.md']:
-        with open(local_path, 'w', encoding='utf-8') as f:
-            f.write(text)
-        return local_path
+    # Extract headings from source
+    source_headings = _extract_headings_from_doc(source_doc)
 
-    # Learn skeleton and source sequence counts from the original DOCX (if present)
-    if str(original_file).lower().endswith('.docx') and os.path.exists(original_file):
-        try:
-            skel = make_style_skeleton_from_docx(original_file)
-        except Exception:
-            skel = {k: dict(v) for k, v in _DEF_SKEL.items()}
-        try:
-            seq = make_style_sequence_from_docx(original_file)
-        except Exception:
-            seq = []
-    else:
-        skel = {k: dict(v) for k, v in _DEF_SKEL.items()}
-        seq = []
+    # Extract text from refined document
+    refined_text = "\n".join([para.text for para in refined_doc.paragraphs])
 
-    write_docx_with_skeleton(text, local_path, skel, seq)
-    return local_path
+    # Map headings
+    heading_map = _map_headings_to_refined_text(source_headings, refined_text)
 
-# ------------------------
-# Sequence from source DOCX
-# ------------------------
+    # Apply heading styles to refined document
+    for para in refined_doc.paragraphs:
+        text = para.text.strip()
+        if not text:
+            continue
 
-def make_style_sequence_from_docx(source_docx_path: str) -> List[str]:
-    doc = Document(source_docx_path)
-    seq: List[str] = []
+        # Check if this paragraph matches a mapped heading
+        for level, heading_text in heading_map.items():
+            if text.lower() == heading_text.lower() or text.lower().startswith(heading_text.lower()):
+                # Apply heading style
+                style_name = f"Heading {level}"
+                style = _get_style_by_name(refined_doc, style_name)
+                if style:
+                    para.style = style
+                break
+        else:
+            # Check for markdown headings
+            if text.startswith("#"):
+                level = len(text) - len(text.lstrip("#"))
+                style_name = f"Heading {min(level, 6)}"
+                style = _get_style_by_name(refined_doc, style_name)
+                if style:
+                    para.style = style
+                    # Remove markdown markers
+                    para.text = text.lstrip("#").strip()
 
-    def level_to_name(lvl: int) -> str:
-        return {1: 'Heading 1', 2: 'Heading 2', 3: 'Heading 3'}.get(lvl, 'Normal')
+    # Save output
+    refined_doc.save(output_path)
 
-    def para_level(p) -> int:
-        name = getattr(getattr(p, 'style', None), 'name', '') or ''
-        m = re.search(r'heading\s*(\d)', name, flags=re.IGNORECASE)
-        lvl = int(m.group(1)) if m else 0
-        if lvl == 0:
-            try:
-                ppr = p._element.pPr
-                if ppr is not None and getattr(ppr, 'outlineLvl', None) is not None and ppr.outlineLvl.val is not None:
-                    lvl = int(ppr.outlineLvl.val) + 1
-            except Exception:
-                pass
-        if lvl == 0:
-            for r in p.runs:
-                try:
-                    rname = getattr(getattr(r, 'style', None), 'name', '') or ''
-                    m2 = re.search(r'heading\s*(\d)', rname, flags=re.IGNORECASE)
-                    if m2:
-                        lvl = int(m2.group(1)); break
-                except Exception:
-                    pass
-        return lvl if 1 <= lvl <= 3 else 0
+# ---------------------------
+# Google Drive integration
+# ---------------------------
 
-    def walk(el):
-        if hasattr(el, 'paragraphs'):
-            for p in el.paragraphs:
-                seq.append(level_to_name(para_level(p)))
-        if hasattr(el, 'tables'):
-            for t in el.tables:
-                for row in t.rows:
-                    for cell in row.cells:
-                        walk(cell)
+def get_drive_service():
+    """Get Google Drive service using service account credentials."""
+    creds = get_google_credentials()
+    if not creds:
+        raise ValueError("Failed to get Google credentials")
+    return build('drive', 'v3', credentials=creds)
 
-    walk(doc)
-    return seq
-
-# ------------------------------
-# Drive + OAuth + Docs helpers
-# ------------------------------
-
-def extract_drive_file_id(link_or_id: str) -> str:
-    m = re.search(r'/d/([A-Za-z0-9_-]+)', link_or_id)
-    if m:
-        return m.group(1)
-    qs = parse_qs(urlparse(link_or_id).query)
-    if 'id' in qs:
-        return qs['id'][0]
-    clean = link_or_id.strip()
-    if re.fullmatch(r'[A-Za-z0-9_-]{10,}', clean):
-        return clean
-    raise ValueError(f"Could not parse Drive file ID from '{link_or_id}'")
-
+def get_docs_service():
+    """Get Google Docs service using service account credentials."""
+    creds = get_google_credentials()
+    if not creds:
+        raise ValueError("Failed to get Google credentials")
+    return build('docs', 'v1', credentials=creds)
 
 def download_drive_file(link_or_id: str, dest_path: str) -> str:
-    file_id = extract_drive_file_id(link_or_id)
-    creds = get_google_credentials()
-    drive = build('drive', 'v3', credentials=creds)
-    # Retry with exponential backoff for transient and quota errors
-    max_retries = int(os.getenv('API_MAX_RETRIES', '6'))
-    backoff = float(os.getenv('API_BACKOFF_START', '1.0'))
-    backoff_cap = float(os.getenv('API_BACKOFF_CAP', '8.0'))
-    for attempt in range(max_retries):
-        try:
-            request = drive.files().get_media(fileId=file_id)
-            fh = io.FileIO(dest_path, 'wb')
-            downloader = MediaIoBaseDownload(fh, request)
-            done = False
-            while not done:
-                _, done = downloader.next_chunk()
-            fh.close()
-            return dest_path
-        except HttpError as e:
-            status = getattr(getattr(e, 'resp', None), 'status', None)
-            if status == 404:
-                raise FileNotFoundError(f"Drive file not found: {file_id}")
-            if status in (429, 403, 500, 503):
-                time.sleep(backoff + random.uniform(0, 0.25))
-                backoff = min(backoff_cap, backoff * 2.0)
-                continue
-            raise
+    """
+    Download a Google Drive file by link or file ID.
+    
+    Args:
+        link_or_id: Google Drive share link or file ID
+        dest_path: Local path to save the file
+        
+    Returns:
+        Path to downloaded file
+    """
+    try:
+        # Extract file ID from link if needed
+        file_id = link_or_id
+        if 'drive.google.com' in link_or_id or 'docs.google.com' in link_or_id:
+            parsed = urlparse(link_or_id)
+            if '/d/' in parsed.path:
+                file_id = parsed.path.split('/d/')[1].split('/')[0]
+            elif 'id=' in parsed.query:
+                file_id = parse_qs(parsed.query)['id'][0]
+        
+        service = get_drive_service()
+        
+        # Get file metadata
+        file_metadata = service.files().get(fileId=file_id).execute()
+        mime_type = file_metadata.get('mimeType', '')
+        
+        # Handle Google Docs format
+        if mime_type == 'application/vnd.google-apps.document':
+            # Export as DOCX
+            request = service.files().export_media(fileId=file_id, mimeType='application/vnd.openxmlformats-officedocument.wordprocessingml.document')
+        elif mime_type == 'application/vnd.google-apps.spreadsheet':
+            # Export as XLSX
+            request = service.files().export_media(fileId=file_id, mimeType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+        else:
+            # Download directly
+            request = service.files().get_media(fileId=file_id)
+        
+        # Download file
+        fh = io.FileIO(dest_path, 'wb')
+        downloader = MediaIoBaseDownload(fh, request)
+        done = False
+        while done is False:
+            status, done = downloader.next_chunk()
+        
+        return dest_path
+        
+    except HttpError as e:
+        raise
 
 OAUTH_SCOPES = ['https://www.googleapis.com/auth/drive', 'https://www.googleapis.com/auth/documents']
 
-def get_google_credentials(credentials_path: str = None, token_path: str = None) -> Credentials:
-    # Check for service account credentials from environment variable first (for Vercel/serverless)
-    # This allows credentials to be provided as a JSON string in environment variables
-    google_creds_json = os.getenv('GOOGLE_CREDENTIALS_JSON')
-    if google_creds_json:
+def _parse_json_from_env(env_value: str) -> dict:
+    """
+    Parse JSON from environment variable, handling various formats:
+    - Standard JSON string
+    - Base64 encoded JSON
+    - JSON with escaped quotes
+    - Multi-line JSON (with newlines)
+    """
+    if not env_value or not env_value.strip():
+        raise ValueError("Empty JSON value")
+    
+    # Try to decode as base64 first (if it looks like base64 or if env var ends with _BASE64)
+    if len(env_value) > 100 and not env_value.strip().startswith('{'):
         try:
-            # Parse JSON - handle escaped newlines in private key
-            creds_data = _json.loads(google_creds_json)
+            decoded = base64.b64decode(env_value).decode('utf-8')
+            return _json.loads(decoded)
+        except Exception:
+            pass  # Not base64, continue with normal parsing
+    
+    # Check for base64 variant
+    base64_json = os.getenv('GOOGLE_SERVICE_ACCOUNT_JSON_BASE64')
+    if base64_json:
+        try:
+            decoded = base64.b64decode(base64_json).decode('utf-8')
+            return _json.loads(decoded)
+        except Exception as e:
+            raise ValueError(f"Failed to decode base64 JSON: {e}")
+    
+    # Try parsing as-is
+    try:
+        return _json.loads(env_value)
+    except _json.JSONDecodeError:
+        pass
+    
+    # Try removing leading/trailing whitespace and quotes
+    cleaned = env_value.strip()
+    if cleaned.startswith('"') and cleaned.endswith('"'):
+        cleaned = cleaned[1:-1]
+    if cleaned.startswith("'") and cleaned.endswith("'"):
+        cleaned = cleaned[1:-1]
+    
+    # Try parsing cleaned value
+    try:
+        return _json.loads(cleaned)
+    except _json.JSONDecodeError:
+        pass
+    
+    # Try unescaping common escape sequences
+    cleaned = cleaned.replace('\\"', '"').replace("\\'", "'").replace('\\n', '\n').replace('\\r', '\r').replace('\\t', '\t')
+    try:
+        return _json.loads(cleaned)
+    except _json.JSONDecodeError:
+        pass
+    
+    # Last attempt: try to fix common issues
+    # Replace single quotes with double quotes (very basic, may not work for all cases)
+    cleaned = re.sub(r"'([^']*)':", r'"\1":', cleaned)  # Keys
+    cleaned = re.sub(r":\s*'([^']*)'", r': "\1"', cleaned)  # String values
+    try:
+        return _json.loads(cleaned)
+    except _json.JSONDecodeError as e:
+        raise ValueError(f"Failed to parse JSON from environment variable. Error: {e}. Value preview: {env_value[:100]}...")
+
+def get_google_credentials(credentials_path: str = None, token_path: str = None) -> Credentials:
+    """
+    Get Google credentials from environment variables (preferred) or files (fallback).
+    
+    Priority:
+    1. GOOGLE_SERVICE_ACCOUNT_JSON (env var with JSON string)
+    2. GOOGLE_SERVICE_ACCOUNT_FILE (env var with file path)
+    3. GOOGLE_OAUTH_CREDENTIALS_JSON + GOOGLE_OAUTH_TOKEN_JSON (env vars)
+    4. File-based fallback (for backward compatibility)
+    """
+    import json as _json
+    
+    # Priority 1: Service account JSON from environment variable
+    service_account_json = os.getenv('GOOGLE_SERVICE_ACCOUNT_JSON')
+    if service_account_json and service_account_json.strip() and service_account_json.strip() not in ['', 'null', 'None']:
+        try:
+            creds_data = _parse_json_from_env(service_account_json)
             
             # Validate required fields
             required_fields = ['type', 'project_id', 'private_key', 'client_email']
-            missing_fields = [f for f in required_fields if f not in creds_data]
+            missing_fields = [field for field in required_fields if field not in creds_data]
             if missing_fields:
-                raise ValueError(f"Missing required fields in credentials: {missing_fields}")
+                raise ValueError(f"Missing required fields in service account JSON: {missing_fields}")
             
-            # Fix private key if it has escaped newlines (common when pasting JSON into env vars)
-            if 'private_key' in creds_data:
-                private_key = creds_data['private_key']
-                if not isinstance(private_key, str):
-                    raise ValueError(f"Private key must be a string, got {type(private_key)}")
-                
-                # When JSON is parsed, \n in the JSON string becomes actual newline
-                # But if the env var was set incorrectly, we might have literal \n strings
-                # Check if we have literal backslash-n sequences (not actual newlines)
-                if '\\n' in private_key and '\n' not in private_key:
-                    # We have escaped newlines that weren't converted - fix them
-                    private_key = private_key.replace('\\n', '\n')
-                
-                # Ensure proper format - find BEGIN marker if it's not at the start
-                if not private_key.startswith('-----BEGIN'):
-                    begin_idx = private_key.find('-----BEGIN')
-                    if begin_idx > 0:
-                        private_key = private_key[begin_idx:]
-                    elif begin_idx == -1:
-                        raise ValueError("Private key does not contain '-----BEGIN PRIVATE KEY-----' marker")
-                
-                # Validate the key has proper structure
-                if not private_key.endswith('-----END PRIVATE KEY-----\n') and not private_key.endswith('-----END PRIVATE KEY-----'):
-                    # Try to find the end marker
-                    end_idx = private_key.find('-----END PRIVATE KEY-----')
-                    if end_idx > 0:
-                        private_key = private_key[:end_idx + len('-----END PRIVATE KEY-----')]
-                    else:
-                        raise ValueError("Private key does not contain '-----END PRIVATE KEY-----' marker")
-                
-                creds_data['private_key'] = private_key
+            if creds_data.get('type') != 'service_account':
+                raise ValueError(f"Invalid service account type: {creds_data.get('type')}")
             
             # Validate private key format
-            if not creds_data['private_key'].startswith('-----BEGIN PRIVATE KEY-----'):
-                raise ValueError("Invalid private key format: must start with '-----BEGIN PRIVATE KEY-----'")
+            private_key = creds_data.get('private_key', '')
+            if not private_key or not private_key.startswith('-----BEGIN PRIVATE KEY-----'):
+                raise ValueError("Invalid private key format in service account JSON")
             
-            # Write to temp file for service account authentication
-            is_vercel = os.getenv('VERCEL') == '1' or os.getenv('VERCEL_ENV') is not None
-            if is_vercel:
-                temp_dir = Path('/tmp/config')
-                temp_dir.mkdir(parents=True, exist_ok=True)
-                temp_file = temp_dir / 'google_credentials.json'
-            else:
-                # Use tempfile for local development
-                temp_file_obj = tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False)
-                temp_file = Path(temp_file_obj.name)
-                temp_file_obj.close()
+            creds = service_account.Credentials.from_service_account_info(
+                creds_data,
+                scopes=OAUTH_SCOPES
+            )
+            return creds
+        except Exception as e:
+            print(f"⚠️  Failed to load service account from GOOGLE_SERVICE_ACCOUNT_JSON: {e}")
+            print(f"   Error type: {type(e).__name__}")
+            print(f"   💡 TIP: Use GOOGLE_SERVICE_ACCOUNT_FILE=config/google_credentials.json instead")
+            print(f"   📖 See backend/FIX_GOOGLE_DRIVE_NOW.md for help")
+            print("   Trying file-based method...")
+    
+    # Check for base64 variant
+    base64_json = os.getenv('GOOGLE_SERVICE_ACCOUNT_JSON_BASE64')
+    if base64_json and base64_json.strip():
+        try:
+            decoded = base64.b64decode(base64_json).decode('utf-8')
+            creds_data = _json.loads(decoded)
             
-            # Use from_service_account_info instead of file (more reliable)
-            # This avoids file I/O issues and is the recommended approach when you have the JSON data
+            # Validate required fields
+            required_fields = ['type', 'project_id', 'private_key', 'client_email']
+            missing_fields = [field for field in required_fields if field not in creds_data]
+            if missing_fields:
+                raise ValueError(f"Missing required fields in service account JSON: {missing_fields}")
+            
+            if creds_data.get('type') != 'service_account':
+                raise ValueError(f"Invalid service account type: {creds_data.get('type')}")
+            
+            creds = service_account.Credentials.from_service_account_info(
+                creds_data,
+                scopes=OAUTH_SCOPES
+            )
+            return creds
+        except Exception as e:
+            print(f"Warning: Failed to load service account from GOOGLE_SERVICE_ACCOUNT_JSON_BASE64: {e}")
+            print("Trying other methods...")
+    
+    # Priority 2: Service account file path from environment variable
+    service_account_file = os.getenv('GOOGLE_SERVICE_ACCOUNT_FILE')
+    if service_account_file:
+        # Resolve relative paths relative to backend directory
+        if not os.path.isabs(service_account_file):
+            backend_dir = os.path.dirname(os.path.dirname(__file__))
+            service_account_file = os.path.join(backend_dir, service_account_file)
+        
+        if os.path.exists(service_account_file):
             try:
-                creds = service_account.Credentials.from_service_account_info(
-                    creds_data,
+                creds = service_account.Credentials.from_service_account_file(
+                    service_account_file,
                     scopes=OAUTH_SCOPES
                 )
-                
-                # Verify credentials are valid
-                if not creds:
-                    raise ValueError("Failed to create credentials object")
-                
+                print(f"✅ Loaded Google credentials from file: {service_account_file}")
                 return creds
             except Exception as e:
-                # Fallback: try writing to file if from_service_account_info fails
-                import traceback
-                print(f"Warning: from_service_account_info failed, trying file method: {e}")
-                print(traceback.format_exc())
-                
-                # Write credentials to temp file as fallback
-                is_vercel = os.getenv('VERCEL') == '1' or os.getenv('VERCEL_ENV') is not None
-                if is_vercel:
-                    temp_dir = Path('/tmp/config')
-                    temp_dir.mkdir(parents=True, exist_ok=True)
-                    temp_file = temp_dir / 'google_credentials.json'
-                else:
-                    temp_file_obj = tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False)
-                    temp_file = Path(temp_file_obj.name)
-                    temp_file_obj.close()
-                
-                with open(temp_file, 'w') as f:
-                    _json.dump(creds_data, f, indent=2)
-                
-                creds = service_account.Credentials.from_service_account_file(
-                    str(temp_file),
-                    scopes=OAUTH_SCOPES
-                )
-                return creds
-        except Exception as e:
-            import traceback
-            error_msg = f"Failed to load Google credentials from GOOGLE_CREDENTIALS_JSON env var: {e}"
-            print(f"Warning: {error_msg}")
-            print(traceback.format_exc())
-            # Continue to try file-based credentials
+                print(f"⚠️  Failed to load service account from file {service_account_file}: {e}")
+                print("   Trying default file location...")
+        else:
+            print(f"⚠️  GOOGLE_SERVICE_ACCOUNT_FILE specified but file not found: {service_account_file}")
     
-    # Check for service account file first
-    # Prefer explicit env var; default to backend/config/google_credentials.json
+    # Try default service account file location
     backend_dir = os.path.dirname(os.path.dirname(__file__))
     default_service_account = os.path.join(backend_dir, 'config', 'google_credentials.json')
-    service_account_file = os.getenv('GOOGLE_SERVICE_ACCOUNT_FILE', default_service_account)
+    if os.path.exists(default_service_account):
+        try:
+            creds = service_account.Credentials.from_service_account_file(
+                default_service_account,
+                scopes=OAUTH_SCOPES
+            )
+            print(f"✅ Loaded Google credentials from default file: {default_service_account}")
+            
+            # Try to validate credentials by attempting to refresh
+            try:
+                from google.auth.transport.requests import Request
+                if not creds.valid:
+                    creds.refresh(Request())
+                print(f"✅ Google credentials validated successfully")
+                return creds
+            except Exception as refresh_error:
+                error_msg = str(refresh_error)
+                if 'invalid_grant' in error_msg or 'JWT' in error_msg or 'signature' in error_msg:
+                    print(f"❌ CRITICAL: Invalid JWT Signature in credentials file!")
+                    print(f"   The service account key is invalid or has been regenerated.")
+                    print(f"   SOLUTION: Regenerate the key in Google Cloud Console")
+                    print(f"   See: backend/FIX_INVALID_JWT_SIGNATURE.md for instructions")
+                    print(f"   Service Account: {creds.service_account_email if hasattr(creds, 'service_account_email') else 'unknown'}")
+                else:
+                    print(f"⚠️  Failed to validate credentials: {refresh_error}")
+                # Don't return None yet - let it try OAuth flow
+                raise refresh_error
+            
+        except Exception as e:
+            error_msg = str(e)
+            if 'invalid_grant' in error_msg or 'JWT' in error_msg or 'signature' in error_msg:
+                print(f"❌ CRITICAL: Invalid JWT Signature!")
+                print(f"   Your service account key needs to be regenerated.")
+                print(f"   📖 See: backend/FIX_INVALID_JWT_SIGNATURE.md")
+            else:
+                print(f"⚠️  Failed to load service account from default file: {e}")
+            print("   Trying OAuth flow...")
+    
+    # Priority 3: OAuth credentials from environment variables
+    oauth_credentials_json = os.getenv('GOOGLE_OAUTH_CREDENTIALS_JSON')
+    oauth_token_json = os.getenv('GOOGLE_OAUTH_TOKEN_JSON')
+    
+    if oauth_credentials_json:
+        try:
+            creds_data = _parse_json_from_env(oauth_credentials_json)
+            # Create credentials from info
+            from google.oauth2.credentials import Credentials as OAuthCredentials
+            
+            # Try to load token from env var
+            creds = None
+            if oauth_token_json:
+                try:
+                    token_data = _parse_json_from_env(oauth_token_json)
+                    creds = OAuthCredentials.from_authorized_user_info(
+                        {**creds_data, **token_data},
+                        scopes=OAUTH_SCOPES
+                    )
+                except Exception:
+                    pass
+            
+            # If no valid token, need to do OAuth flow (interactive)
+            if not creds or not creds.valid:
+                if creds and creds.expired and creds.refresh_token:
+                    creds.refresh(Request())
+                else:
+                    # For OAuth flow, we can't do interactive flow in production, return None or raise
+                    raise ValueError(
+                        "OAuth credentials require interactive authentication. "
+                        "Use service account credentials (GOOGLE_SERVICE_ACCOUNT_JSON) for production."
+                    )
+            return creds
+        except Exception as e:
+            print(f"Warning: Failed to load OAuth credentials from env vars: {e}")
+    
+    # Priority 4: Fallback to file-based (for backward compatibility during migration)
+    backend_dir = os.path.dirname(os.path.dirname(__file__))
+    default_service_account = os.path.join(backend_dir, 'config', 'google_credentials.json')
     
     if credentials_path is None:
         credentials_path = os.path.join(backend_dir, 'config', 'credentials.json')
     if token_path is None:
         token_path = os.path.join(backend_dir, 'config', 'token.json')
-    if os.path.exists(service_account_file):
+    
+    # Try default service account file
+    if os.path.exists(default_service_account):
         try:
-            # Use service account authentication
             creds = service_account.Credentials.from_service_account_file(
-                service_account_file,
+                default_service_account,
                 scopes=OAUTH_SCOPES
             )
             return creds
         except Exception as e:
-            print(f"Warning: Failed to load service account credentials: {e}")
-            print("Falling back to OAuth flow...")
+            print(f"Warning: Failed to load service account from default file: {e}")
     
-    # Fall back to OAuth flow
+    # Fall back to OAuth file flow (interactive - not suitable for production)
     creds = None
     token_file = Path(token_path)
     if token_file.exists():
-        creds = pickle.loads(token_file.read_bytes())
+        try:
+            creds = pickle.loads(token_file.read_bytes())
+        except Exception:
+            pass
+    
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
-            flow = InstalledAppFlow.from_client_secrets_file(credentials_path, OAUTH_SCOPES)
-            creds = flow.run_local_server(port=0)
-        token_file.write_bytes(pickle.dumps(creds))
+            try:
+                creds.refresh(Request())
+            except Exception:
+                creds = None
+        
+        if not creds and os.path.exists(credentials_path):
+            try:
+                flow = InstalledAppFlow.from_client_secrets_file(credentials_path, OAUTH_SCOPES)
+                creds = flow.run_local_server(port=0)
+                token_file.write_bytes(pickle.dumps(creds))
+            except Exception as e:
+                print(f"Warning: OAuth flow failed: {e}")
+                return None
+    
+    # Final check: if we still don't have valid credentials, print helpful error
+    if not creds:
+        print()
+        print("=" * 70)
+        print("❌ GOOGLE DRIVE CREDENTIALS NOT FOUND")
+        print("=" * 70)
+        print()
+        print("No valid Google credentials could be loaded.")
+        print()
+        print("SOLUTIONS:")
+        print("1. Regenerate service account key (RECOMMENDED):")
+        print("   - Go to: https://console.cloud.google.com/iam-admin/serviceaccounts")
+        print("   - Find: turbo-alan-google-drive@crack-petal-469722-d1.iam.gserviceaccount.com")
+        print("   - Create new JSON key and save to: backend/config/google_credentials.json")
+        print()
+        print("2. Or set GOOGLE_SERVICE_ACCOUNT_FILE in .env:")
+        print("   GOOGLE_SERVICE_ACCOUNT_FILE=config/google_credentials.json")
+        print()
+        print("📖 See: backend/FIX_INVALID_JWT_SIGNATURE.md for detailed instructions")
+        print("=" * 70)
+        print()
+    
     return creds
 
-def get_drive_service_oauth():
-    """Get Google Drive service using OAuth credentials"""
+# ---------------------------
+# Heuristics loading
+# ---------------------------
+
+def load_heuristics() -> Dict[str, Any]:
+    """Load heuristics configuration from YAML file."""
+    backend_dir = os.path.dirname(os.path.dirname(__file__))
+    heuristics_path = os.path.join(backend_dir, 'config', 'heuristics.yaml')
+    
+    if not os.path.exists(heuristics_path):
+        # Return default heuristics if file doesn't exist
+        return {
+            'preserve_layout': True,
+            'transforms': {
+                'punctuation': 0.2,
+                'splits': 0.2,
+                'transitions': 0.2,
+                'rhythm': 0.2,
+                'keywords': 0.2,
+                'grammar': 0.2,
+                'synonyms': 0.2,
+                'micro_degrade': 0.2,
+            },
+            'paragraph': {
+                'min_sentences': 1,
+                'max_sentences': 6,
+            },
+            'length': {
+                'ratio_range': [0.9, 1.1],
+            },
+            'sampling': {
+                'temperature': 0.5,
+                'top_p': 0.9,
+            },
+            'sampling_schedule': [0.5, 0.45, 0.4],
+            'top_p_schedule': [0.9, 0.81, 0.729],
+            'synonym': {},
+            'grammar': {},
+            'micro_degrade': {},
+            'phases': [
+                'You are Turbo Alan Refiner. Apply micro-degradation transformations to reduce AI-detection signals while preserving coherence.',
+                'You are Turbo Alan Refiner. Further vary punctuation, sentence length, and word choice to evade scanners without harming readability.',
+                'You are Turbo Alan Refiner. Final pass: introduce subtle noise patterns, maintain natural flow, and ensure the text reads as human-written.',
+            ],
+        }
+    
     try:
-        from googleapiclient.discovery import build
-        creds = get_google_credentials()
-        if not creds:
-            return None
-        service = build('drive', 'v3', credentials=creds)
-        return service
+        with open(heuristics_path, 'r', encoding='utf-8') as f:
+            return yaml.safe_load(f) or {}
     except Exception as e:
-        import traceback
-        print(f"Error building Drive service: {e}\n{traceback.format_exc()}")
-        return None
+        print(f"Warning: Failed to load heuristics from {heuristics_path}: {e}")
+        return {}
 
-# -----------------------------
-# Google Docs round‑trip pieces
-# -----------------------------
+# ---------------------------
+# File I/O utilities
+# ---------------------------
 
-def fetch_gdoc_body(creds, document_id: str) -> list:
-    service = build('docs', 'v1', credentials=creds)
-    max_retries = int(os.getenv('API_MAX_RETRIES', '6'))
-    backoff = float(os.getenv('API_BACKOFF_START', '1.0'))
-    backoff_cap = float(os.getenv('API_BACKOFF_CAP', '8.0'))
-    for attempt in range(max_retries):
+def read_text_from_file(file_path: str) -> str:
+    """Read text from a file, supporting various formats."""
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"File not found: {file_path}")
+    
+    # Determine file type
+    ext = os.path.splitext(file_path)[1].lower()
+    
+    if ext == '.pdf':
+        return _extract_text_from_pdf(file_path)
+    elif ext == '.doc':
+        return _extract_text_from_doc(file_path)
+    elif ext == '.docx':
         try:
-            doc = service.documents().get(documentId=document_id).execute()
-            return doc.get('body', {}).get('content', [])
-        except HttpError as e:
-            status = getattr(getattr(e, 'resp', None), 'status', None)
-            if status in (429, 403, 500, 503):
-                time.sleep(backoff + random.uniform(0, 0.25))
-                backoff = min(backoff_cap, backoff * 2.0)
-                continue
-            raise
+            doc = Document(file_path)
+            return '\n'.join([para.text for para in doc.paragraphs])
+        except Exception as e:
+            raise ValueError(f"Failed to read DOCX file: {e}")
+    else:
+        # Plain text
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                return f.read()
+        except UnicodeDecodeError:
+            # Try with different encoding
+            with open(file_path, 'r', encoding='latin-1') as f:
+                return f.read()
 
-
-def write_gdoc_to_docx(creds, document_id: str, template_path: str, output_path: str) -> None:
-    doc = Document(template_path)
-    content = fetch_gdoc_body(creds, document_id)
-    for element in content:
-        para = element.get('paragraph')
-        if para is None:
-            continue
-        text_runs = [run.get('textRun', {}).get('content', '') for run in para.get('elements', []) if run.get('textRun')]
-        full_text = ''.join(text_runs).rstrip("\r\n")
-        style_type = para.get('paragraphStyle', {}).get('namedStyleType', '')
-        if   style_type == 'HEADING_1': doc.add_heading(full_text, level=1)
-        elif style_type == 'HEADING_2': doc.add_heading(full_text, level=2)
-        elif style_type == 'HEADING_3': doc.add_heading(full_text, level=3)
-        elif style_type == 'HEADING_4': doc.add_heading(full_text, level=4)
-        elif style_type == 'HEADING_5': doc.add_heading(full_text, level=5)
-        elif style_type == 'HEADING_6': doc.add_heading(full_text, level=6)
+def write_text_to_file(text: str = None, file_path: str = None, output_dir: str = None, 
+                       base_name: str = None, ext: str = None, original_file: str = None, 
+                       iteration: int = None, **kwargs) -> str:
+    """
+    Write text to a file. Supports multiple calling conventions:
+    
+    Simple: write_text_to_file(text, file_path)
+    Advanced: write_text_to_file(text=..., output_dir=..., base_name=..., ext=..., ...)
+    """
+    # Handle advanced calling convention
+    if output_dir and base_name and ext:
+        if not text:
+            raise ValueError("text parameter is required")
+        # Sanitize base_name to prevent path injection
+        base_name = str(base_name).strip()
+        # Remove any path components and invalid characters
+        base_name = os.path.basename(base_name)
+        # Remove invalid characters for Windows/Unix paths
+        base_name = re.sub(r'[<>:"|?*\n\r\t]', '_', base_name)
+        # Remove any remaining control characters
+        base_name = re.sub(r'[\x00-\x1f\x7f-\x9f]', '_', base_name)
+        # Limit length to prevent filesystem issues (max 200 chars)
+        if len(base_name) > 200:
+            base_name = base_name[:200]
+        # Ensure base_name is not empty
+        if not base_name or base_name == '.' or base_name == '..':
+            base_name = 'output'
+        file_path = os.path.join(output_dir, f"{base_name}{ext}")
+        if iteration is not None and iteration > 0:
+            file_path = os.path.join(output_dir, f"{base_name}_pass{iteration}{ext}")
+    
+    # Fallback to simple convention
+    if not file_path:
+        if 'file_path' in kwargs:
+            file_path = kwargs['file_path']
         else:
-            p = doc.add_paragraph(full_text)
-            p.style = _get_style_by_name(doc, 'Normal')
-    doc.save(output_path)
+            raise ValueError("Either file_path or (output_dir, base_name, ext) must be provided")
+    
+    if not text:
+        raise ValueError("text parameter is required")
+    
+    # Create directory if needed
+    os.makedirs(os.path.dirname(file_path) if os.path.dirname(file_path) else '.', exist_ok=True)
+    
+    # Handle DOCX format
+    if ext == '.docx' or (file_path and file_path.endswith('.docx')):
+        # Use write_docx_with_skeleton for DOCX files
+        skeleton = None
+        if original_file and os.path.exists(original_file):
+            try:
+                skeleton = make_style_skeleton_from_docx(original_file)
+            except Exception:
+                pass
+        return write_docx_with_skeleton(text, file_path, skeleton)
+    
+    # Write plain text
+    with open(file_path, 'w', encoding='utf-8') as f:
+        f.write(text)
+    
+    return file_path
 
-# Optional hook (no‑op)
+# ---------------------------
+# Google Drive utilities
+# ---------------------------
 
-def apply_named_styles(local_docx_path: str, doc_id: str, creds: Credentials) -> None:
+def extract_drive_file_id(url_or_id: str) -> str:
+    """Extract file ID from Google Drive URL or return as-is if already an ID."""
+    if not url_or_id:
+        return ""
+    
+    # If it's already just an ID (no slashes or special chars), return it
+    if '/' not in url_or_id and '?' not in url_or_id:
+        return url_or_id
+    
+    # Try to extract from URL
+    parsed = urlparse(url_or_id)
+    
+    # Check path for /d/FILE_ID pattern
+    if '/d/' in parsed.path:
+        file_id = parsed.path.split('/d/')[1].split('/')[0]
+        return file_id
+    
+    # Check query parameters
+    if 'id=' in parsed.query:
+        return parse_qs(parsed.query)['id'][0]
+    
+    # Return as-is if we can't parse it
+    return url_or_id
+
+def create_google_doc(title: str, content: str = "") -> str:
+    """Create a new Google Doc and return its file ID."""
     try:
-        pass
-    except HttpError as e:
-        print(f"⚠️ Failed to apply heading/text styles: {e}")
+        docs_service = get_docs_service()
+        drive_service = get_drive_service()
+        
+        # Create document
+        doc = docs_service.documents().create(body={'title': title}).execute()
+        doc_id = doc.get('documentId')
+        
+        if content:
+            # Insert content
+            docs_service.documents().batchUpdate(
+                documentId=doc_id,
+                body={'requests': [{
+                    'insertText': {
+                        'location': {'index': 1},
+                        'text': content
+                    }
+                }]}
+            ).execute()
+        
+        return doc_id
+    except Exception as e:
+        raise ValueError(f"Failed to create Google Doc: {e}")
 
+# ---------------------------
+# DOCX style utilities
+# ---------------------------
 
-def upload_and_convert_docx_to_gdoc(local_docx: str, title: str, folder_id: str, creds: Credentials) -> str:
-    drive = build('drive', 'v3', credentials=creds)
-    media = MediaFileUpload(local_docx, mimetype='application/vnd.openxmlformats-officedocument.wordprocessingml.document', resumable=True)
-    metadata = {'name': title, 'parents': [folder_id], 'mimeType': 'application/vnd.google-apps.document'}
-    max_retries = int(os.getenv('API_MAX_RETRIES', '6'))
-    backoff = float(os.getenv('API_BACKOFF_START', '1.0'))
-    backoff_cap = float(os.getenv('API_BACKOFF_CAP', '8.0'))
-    for attempt in range(max_retries):
-        try:
-            file = drive.files().create(body=metadata, media_body=media, fields='id').execute()
-            return file['id']
-        except HttpError as e:
-            status = getattr(getattr(e, 'resp', None), 'status', None)
-            if status in (429, 403, 500, 503):
-                time.sleep(backoff + random.uniform(0, 0.25))
-                backoff = min(backoff_cap, backoff * 2.0)
-                continue
-            raise
+def make_style_skeleton_from_docx(docx_path: str) -> Dict[str, Any]:
+    """Extract style skeleton from a DOCX file."""
+    try:
+        doc = Document(docx_path)
+        skeleton = {
+            'styles': {},
+            'default_font': {'name': 'Arial', 'size': 11},
+        }
+        
+        for para in doc.paragraphs[:50]:  # Sample first 50 paragraphs
+            style_name = para.style.name if para.style else 'Normal'
+            if style_name not in skeleton['styles']:
+                runs = para.runs
+                if runs:
+                    first_run = runs[0]
+                    skeleton['styles'][style_name] = {
+                        'font_name': first_run.font.name or 'Arial',
+                        'font_size': first_run.font.size.pt if first_run.font.size else 11,
+                        'bold': first_run.bold,
+                        'italic': first_run.italic,
+                    }
+        
+        return skeleton
+    except Exception as e:
+        print(f"Warning: Failed to extract style skeleton: {e}")
+        return {'styles': {}, 'default_font': {'name': 'Arial', 'size': 11}}
 
-def create_google_doc(local_docx: str, title: str, folder_id: str, creds: Credentials) -> str:
-    doc_id = upload_and_convert_docx_to_gdoc(local_docx, title, folder_id, creds)
-    apply_named_styles(local_docx, doc_id, creds)
-    return doc_id
+def write_docx_with_skeleton(text: str, output_path: str, skeleton: Dict[str, Any] = None):
+    """Write text to DOCX file with style skeleton."""
+    doc = Document()
+    
+    # Apply default font
+    default_font = (skeleton or {}).get('default_font', {'name': 'Arial', 'size': 11})
+    style = doc.styles['Normal']
+    style.font.name = default_font['name']
+    style.font.size = Pt(default_font['size'])
+    
+    # Split text into paragraphs and add
+    paragraphs = text.split('\n')
+    for para_text in paragraphs:
+        if para_text.strip():
+            para = doc.add_paragraph(para_text)
+            # Apply style if available
+            if skeleton and 'styles' in skeleton:
+                # Try to match style (simplified)
+                para.style = doc.styles['Normal']
+    
+    doc.save(output_path)
+    return output_path
+
+def make_style_sequence_from_docx(docx_path: str) -> List[Dict[str, Any]]:
+    """Extract style sequence from a DOCX file."""
+    try:
+        doc = Document(docx_path)
+        sequence = []
+        
+        for para in doc.paragraphs:
+            style_name = para.style.name if para.style else 'Normal'
+            runs = para.runs
+            if runs:
+                first_run = runs[0]
+                sequence.append({
+                    'text': para.text,
+                    'style': style_name,
+                    'font_name': first_run.font.name or 'Arial',
+                    'font_size': first_run.font.size.pt if first_run.font.size else 11,
+                    'bold': first_run.bold,
+                    'italic': first_run.italic,
+                })
+            else:
+                sequence.append({
+                    'text': para.text,
+                    'style': style_name,
+                })
+        
+        return sequence
+    except Exception as e:
+        print(f"Warning: Failed to extract style sequence: {e}")
+        return []
+
+# ---------------------------
+# History profile utilities
+# ---------------------------
+
+def derive_history_profile(history_path: str = None) -> Dict[str, float]:
+    """Derive refinement profile from history data."""
+    from core.paths import get_data_dir
+    
+    if history_path is None:
+        history_path = str(get_data_dir() / 'recent_history.json')
+    
+    if not os.path.exists(history_path):
+        # Return default profile
+        return {
+            'brevity_bias': 0.5,
+            'formality_bias': 0.5,
+            'structure_bias': 0.5,
+        }
+    
+    try:
+        with open(history_path, 'r', encoding='utf-8') as f:
+            history = _json.load(f)
+        
+        # Analyze history to derive biases
+        # Simplified implementation - can be enhanced
+        brevity_bias = 0.5
+        formality_bias = 0.5
+        structure_bias = 0.5
+        
+        if isinstance(history, list) and len(history) > 0:
+            # Analyze recent refinements
+            total_changes = 0
+            for entry in history[-10:]:  # Last 10 entries
+                if isinstance(entry, dict):
+                    # Extract metrics if available
+                    pass
+        
+        return {
+            'brevity_bias': brevity_bias,
+            'formality_bias': formality_bias,
+            'structure_bias': structure_bias,
+        }
+    except Exception as e:
+        print(f"Warning: Failed to derive history profile: {e}")
+        return {
+            'brevity_bias': 0.5,
+            'formality_bias': 0.5,
+            'structure_bias': 0.5,
+        }

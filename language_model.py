@@ -5,9 +5,9 @@ import time
 import math
 import os
 import json
+import logging
 from collections import deque, defaultdict
 from datetime import datetime
-from pathlib import Path
 try:  # optional dependency for token budgeting
     import tiktoken
 except Exception:  # pragma: no cover
@@ -22,6 +22,10 @@ OPENAI_PRICING = {
     'gpt-4-turbo': {
         'input': 0.01,  # $0.01 per 1K tokens
         'output': 0.03  # $0.03 per 1K tokens
+    },
+    'gpt-4o': {
+        'input': 0.005,  # $0.005 per 1K tokens
+        'output': 0.015  # $0.015 per 1K tokens
     },
     'gpt-3.5-turbo': {
         'input': 0.0015,  # $0.0015 per 1K tokens
@@ -46,7 +50,7 @@ def calculate_cost(tokens_in: int, tokens_out: int, model: str = "gpt-4") -> dic
         'model': model
     }
 
-# Simple in-memory analytics store with persistence (exported for API)
+# Simple in-memory analytics store with disk persistence (exported for API)
 class _Analytics:
     def __init__(self) -> None:
         self.total_requests = 0
@@ -63,29 +67,22 @@ class _Analytics:
         self.schema_usage: Dict[str, int] = {}  # schema_id -> usage_count
         self.schema_last_used: Dict[str, str] = {}  # schema_id -> last_used_timestamp
         
-        # Persistence for serverless environments
-        self._storage_file = self._get_storage_path()
-        self._read_only_mode = False
+        # Persistence file path
+        from core.paths import get_backend_root
+        from pathlib import Path
+        backend_root = Path(get_backend_root())
+        self._persist_file = str(backend_root / "data" / "analytics_store.json")
+        
+        # Load persisted data on startup
         self._load_from_disk()
     
-    def _get_storage_path(self) -> Path:
-        """Get the path for analytics storage."""
-        import os
-        is_vercel = os.getenv('VERCEL') == '1' or os.getenv('VERCEL_ENV') is not None
-        if is_vercel:
-            storage_dir = Path('/tmp/data')
-        else:
-            backend_dir = Path(__file__).parent.parent
-            storage_dir = backend_dir / 'data'
-        
-        storage_dir.mkdir(parents=True, exist_ok=True)
-        return storage_dir / 'analytics.json'
-    
     def _load_from_disk(self) -> None:
-        """Load analytics data from disk if available."""
+        """Load analytics data from disk if it exists"""
+        logger = logging.getLogger(__name__)
         try:
-            if self._storage_file.exists():
-                with open(self._storage_file, 'r') as f:
+            if os.path.exists(self._persist_file):
+                logger.debug(f"Loading analytics from disk: {self._persist_file}")
+                with open(self._persist_file, 'r') as f:
                     data = json.load(f)
                     self.total_requests = data.get('total_requests', 0)
                     self.total_tokens_in = data.get('total_tokens_in', 0)
@@ -96,18 +93,25 @@ class _Analytics:
                     self.pass_costs = data.get('pass_costs', {})
                     self.schema_usage = data.get('schema_usage', {})
                     self.schema_last_used = data.get('schema_last_used', {})
-                    # Restore events (limited to last 1000 for memory efficiency)
+                    # Restore events (limited to last 10k)
                     events_data = data.get('events', [])
-                    self.events = deque(events_data[-1000:], maxlen=10_000)
+                    self.events = deque(events_data[-10_000:], maxlen=10_000)
+                    logger.info(f"Loaded analytics from disk: {self.total_requests} requests, ${self.total_cost:.6f} total cost")
+            else:
+                logger.debug(f"Analytics file not found at {self._persist_file}, starting with empty analytics")
         except Exception as e:
-            print(f"Warning: Could not load analytics from disk: {e}")
-            self._read_only_mode = True
+            logger.warning(f"Failed to load analytics from disk: {e}", exc_info=True)
+            # Continue with defaults
     
     def _save_to_disk(self) -> None:
-        """Save analytics data to disk."""
-        if self._read_only_mode:
-            return
+        """Save analytics data to disk"""
         try:
+            # Ensure directory exists
+            os.makedirs(os.path.dirname(self._persist_file), exist_ok=True)
+            
+            # Convert deque to list for JSON serialization
+            events_list = list(self.events)
+            
             data = {
                 'total_requests': self.total_requests,
                 'total_tokens_in': self.total_tokens_in,
@@ -118,13 +122,18 @@ class _Analytics:
                 'pass_costs': self.pass_costs,
                 'schema_usage': self.schema_usage,
                 'schema_last_used': self.schema_last_used,
-                'events': list(self.events)[-1000:],  # Save last 1000 events
+                'events': events_list,
             }
-            with open(self._storage_file, 'w') as f:
+            
+            # Atomic write: write to temp file, then rename
+            temp_file = self._persist_file + '.tmp'
+            with open(temp_file, 'w') as f:
                 json.dump(data, f)
+            os.replace(temp_file, self._persist_file)
         except Exception as e:
-            print(f"Warning: Could not save analytics to disk: {e}")
-            self._read_only_mode = True
+            logger = logging.getLogger(__name__)
+            logger.warning(f"Failed to save analytics to disk: {e}", exc_info=True)
+            # Don't fail the request if persistence fails
 
     def add(self, in_tokens: int, out_tokens: int, model: str = "gpt-4", job_id: str = None) -> dict:
         now = int(time.time())
@@ -146,7 +155,15 @@ class _Analytics:
             self.pass_costs[job_id].append(cost_info['total_cost'])
         
         self.events.append((now, in_tokens, out_tokens, model, cost_info['total_cost']))
-        self._save_to_disk()  # Persist after each update
+        
+        # Persist to disk after each update (async, non-blocking)
+        try:
+            self._save_to_disk()
+        except Exception as e:
+            # Don't fail the request if persistence fails
+            logger = logging.getLogger(__name__)
+            logger.warning(f"Failed to persist analytics: {e}", exc_info=True)
+        
         return cost_info
 
     def summary_last_24h(self) -> Dict[str, Any]:
@@ -186,7 +203,11 @@ class _Analytics:
         if schema_level > 0:  # Only track active schemas
             self.schema_usage[schema_id] = self.schema_usage.get(schema_id, 0) + 1
             self.schema_last_used[schema_id] = datetime.now().isoformat()
-            self._save_to_disk()  # Persist after update
+            # Persist to disk
+            try:
+                self._save_to_disk()
+            except Exception:
+                pass  # Don't fail if persistence fails
     
     def get_schema_usage_stats(self) -> dict:
         """Get schema usage statistics"""
@@ -285,14 +306,40 @@ class OpenAIModel:
 
         content = resp.choices[0].message.content or ""
         # Token usage (OpenAI provides usage fields)
+        logger = logging.getLogger(__name__)
         try:
-            used_in = int(getattr(resp, "usage").prompt_tokens or 0)
-            used_out = int(getattr(resp, "usage").completion_tokens or 0)
-        except Exception:
-            used_in = 0; used_out = 0
+            # Access usage object correctly - OpenAI SDK v1+ uses resp.usage directly
+            usage = resp.usage if hasattr(resp, 'usage') else None
+            if usage:
+                used_in = int(usage.prompt_tokens if hasattr(usage, 'prompt_tokens') else (getattr(usage, 'prompt_tokens', 0) or 0))
+                used_out = int(usage.completion_tokens if hasattr(usage, 'completion_tokens') else (getattr(usage, 'completion_tokens', 0) or 0))
+                logger.debug(f"Token usage extracted: {used_in} in, {used_out} out")
+            else:
+                logger.warning("No usage object found in OpenAI response")
+                used_in = 0
+                used_out = 0
+        except Exception as e:
+            logger.warning(f"Failed to extract token usage: {e}", exc_info=True)
+            used_in = 0
+            used_out = 0
+        
+        # Normalize model name for pricing lookup (handle variations like "gpt-4o", "gpt-4-turbo", etc.)
+        model_name = self.model
+        if model_name.startswith("gpt-4o"):
+            model_name = "gpt-4o"
+        elif model_name.startswith("gpt-4-turbo") or model_name.startswith("gpt-4-turbo"):
+            model_name = "gpt-4-turbo"
+        elif model_name.startswith("gpt-4"):
+            model_name = "gpt-4"
+        elif model_name.startswith("gpt-3.5"):
+            model_name = "gpt-3.5-turbo"
         
         # Track cost and return cost information
-        cost_info = analytics_store.add(used_in, used_out, self.model, job_id)
+        cost_info = analytics_store.add(used_in, used_out, model_name, job_id)
+        
+        # Log analytics tracking
+        logger.debug(f"Analytics tracked: {used_in} in, {used_out} out tokens, cost=${cost_info['total_cost']:.6f}, model={model_name}, job_id={job_id}")
+        
         return content, cost_info
 
 

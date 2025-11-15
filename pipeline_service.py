@@ -256,6 +256,10 @@ class RefinementPipeline:
             if job_id:
                 self._current_job_id = job_id
                 self._pass_costs = []  # Reset costs for this pass
+            else:
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.warning(f"No job_id provided for pass {pass_index}")
             
             # Phase-0: optional domain-aware chunking and placeholder compression will be applied
             print(f"PIPELINE: Calling _three_phase_refine for pass {pass_index}")
@@ -359,13 +363,20 @@ class RefinementPipeline:
         # Write local temp
         t0 = time.perf_counter()
         base, ext = os.path.splitext(os.path.basename(input_path))
+        # Ensure ext starts with a dot
+        if ext and not ext.startswith('.'):
+            ext = '.' + ext
+        elif not ext:
+            ext = '.txt'  # Default extension if none found
+        
+        output_dir = os.getenv("TMPDIR", os.getenv("TEMP", "/tmp"))
         local_out = write_text_to_file(
-            os.getenv("TMPDIR", os.getenv("TEMP", "/tmp")),
-            base,
-            ext,
-            final_norm,
-            input_path,
-            pass_index,
+            text=final_norm,
+            output_dir=output_dir,
+            base_name=base,
+            ext=ext,
+            original_file=input_path,
+            iteration=pass_index,
         )
         ps.stages["write"].status = "ok"
         ps.stages["write"].duration_ms = (time.perf_counter() - t0) * 1000.0
@@ -846,9 +857,9 @@ class RefinementPipeline:
         try:
             hist_cfg = (heur.get('history_analysis') or {}) if isinstance(heur, dict) else {}
             if hist_cfg is True or (isinstance(hist_cfg, dict) and hist_cfg.get('enabled', True)):
-                # Default to backend/data/recent_history.json
-                backend_dir = os.path.dirname(os.path.abspath(__file__))
-                default_history = os.path.join(backend_dir, 'data', 'recent_history.json')
+                # Use centralized path configuration
+                from core.paths import get_data_dir
+                default_history = str(get_data_dir() / 'recent_history.json')
                 history_path = hist_cfg.get('history_path', default_history)
                 
                 # Validate history file exists and is readable
@@ -999,7 +1010,15 @@ class RefinementPipeline:
         try:
             user2 = user + "\nAlso provide a JSON object named STRATEGY_SLOTS with keys: primary_strategy, secondary_strategy, modulators (array)."
             print(f"_analyze_strategy: Calling LLM for strategy analysis")
-            strategy_text = self.model.generate(system=system, user=user2, temperature=0.15, max_tokens=500)
+            # Handle tuple return from generate() method
+            result = self.model.generate(system=system, user=user2, temperature=0.15, max_tokens=500, job_id=getattr(self, '_current_job_id', None))
+            if isinstance(result, tuple):
+                strategy_text, cost_info = result
+                # Track cost for strategy analysis
+                if cost_info and hasattr(self, '_pass_costs'):
+                    self._pass_costs.append(cost_info)
+            else:
+                strategy_text = result
             print(f"_analyze_strategy: LLM returned {len(strategy_text)} chars")
         except Exception as e:
             # Fall back to rules if model call fails
@@ -1303,7 +1322,14 @@ class RefinementPipeline:
                     except Exception:
                         pass
                 else:
-                    gen_txt = self.model.generate(system=sys_full, user=payload, temperature=temp, max_tokens=2000)
+                    import logging
+                    logger = logging.getLogger(__name__)
+                    logger.debug("No _current_job_id, calling model.generate without job_id")
+                    result = self.model.generate(system=sys_full, user=payload, temperature=temp, max_tokens=2000)
+                    if isinstance(result, tuple):
+                        gen_txt, cost_info = result
+                    else:
+                        gen_txt = result
 
                 if self.enable_placeholders and ph_map:
                     try:

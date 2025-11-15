@@ -46,22 +46,30 @@ cp env.example .env
 - `OPENAI_API_KEY` - Your OpenAI API key
 
 **Optional:**
-- `GOOGLE_SERVICE_ACCOUNT_FILE` - Path to Google service account JSON (default: `config/google_credentials.json`)
+- `GOOGLE_SERVICE_ACCOUNT_JSON` - Google service account JSON as environment variable (RECOMMENDED for deployment)
+- `GOOGLE_SERVICE_ACCOUNT_FILE` - Path to Google service account JSON file (alternative to env var)
 - `REFINER_OUTPUT_DIR` - Output directory (default: `data/output`)
 - `BACKEND_API_KEY` - Optional API key for endpoint protection
 
 ### 2. Google Drive Credentials
 
-**Option 1: Service Account (Recommended for Production)**
+**Option 1: Service Account JSON from Environment Variable (RECOMMENDED for Production/Deployment)**
+1. Get your service account JSON from Google Cloud Console
+2. Set `GOOGLE_SERVICE_ACCOUNT_JSON` in `.env` with the entire JSON content as a single-line string
+   ```env
+   GOOGLE_SERVICE_ACCOUNT_JSON={"type":"service_account","project_id":"...","private_key":"...",...}
+   ```
+3. See `MIGRATION_TO_ENV_VARS.md` for detailed migration guide
+
+**Option 2: Service Account File (Alternative)**
 1. Place your service account JSON file at `config/google_credentials.json`
 2. Set `GOOGLE_SERVICE_ACCOUNT_FILE=config/google_credentials.json` in `.env`
 
-**Option 2: OAuth (For Development)**
-1. Place OAuth credentials at `config/credentials.json`
-2. Set `GOOGLE_CREDENTIALS_FILE=config/credentials.json` in `.env`
-3. Token will be stored at `config/token.json` after first auth
+**Option 3: OAuth (For Development Only)**
+1. Use `GOOGLE_OAUTH_CREDENTIALS_JSON` and `GOOGLE_OAUTH_TOKEN_JSON` environment variables
+2. Or place OAuth credentials at `config/credentials.json` and `config/token.json` (legacy)
 
-**⚠️ Security Note:** Never commit credential files to git! They are in `.gitignore`.
+**⚠️ Security Note:** Never commit credential files to git! Use environment variables for deployment.
 
 ### 3. Configuration Files
 
