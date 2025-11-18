@@ -520,7 +520,7 @@ def get_google_credentials(credentials_path: str = None, token_path: str = None)
                     print(f"   SOLUTION: Regenerate the key in Google Cloud Console")
                     print(f"   See: backend/FIX_INVALID_JWT_SIGNATURE.md for instructions")
                     print(f"   Service Account: {creds.service_account_email if hasattr(creds, 'service_account_email') else 'unknown'}")
-    else:
+                else:
                     print(f"⚠️  Failed to validate credentials: {refresh_error}")
                 # Don't return None yet - let it try OAuth flow
                 raise refresh_error
