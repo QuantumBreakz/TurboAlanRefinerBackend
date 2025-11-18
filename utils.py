@@ -212,7 +212,7 @@ def _map_headings_to_refined_text(source_headings: List[Tuple[str, int]], refine
         if best_match and best_score > 0.3:  # Threshold for matching
             mapped[best_match[2]] = best_match[1]
             candidate_idx = heading_candidates.index(best_match) + 1
-        else:
+    else:
             # No good match, use source heading as-is
             mapped[source_level] = source_text
 
@@ -253,7 +253,7 @@ def map_headings_to_refined_doc(source_doc_path: str, refined_doc_path: str, out
                 if style:
                     para.style = style
                 break
-        else:
+                else:
             # Check for markdown headings
             if text.startswith("#"):
                 level = len(text) - len(text.lstrip("#"))
@@ -402,15 +402,19 @@ def _parse_json_from_env(env_value: str) -> dict:
 
 def get_google_credentials(credentials_path: str = None, token_path: str = None) -> Credentials:
     """
-    Get Google credentials from environment variables (preferred) or files (fallback).
+    Get Google credentials from environment variables only.
     
     Priority:
-    1. GOOGLE_SERVICE_ACCOUNT_JSON (env var with JSON string)
-    2. GOOGLE_SERVICE_ACCOUNT_FILE (env var with file path)
+    1. GOOGLE_SERVICE_ACCOUNT_JSON (env var with JSON string) - RECOMMENDED
+    2. GOOGLE_SERVICE_ACCOUNT_JSON_BASE64 (env var with base64-encoded JSON)
     3. GOOGLE_OAUTH_CREDENTIALS_JSON + GOOGLE_OAUTH_TOKEN_JSON (env vars)
-    4. File-based fallback (for backward compatibility)
+    
+    Note: File-based credentials are no longer supported for security reasons.
+    Use environment variables instead.
     """
     import json as _json
+    
+    creds = None  # Initialize to None
     
     # Priority 1: Service account JSON from environment variable
     service_account_json = os.getenv('GOOGLE_SERVICE_ACCOUNT_JSON')
@@ -440,9 +444,8 @@ def get_google_credentials(credentials_path: str = None, token_path: str = None)
         except Exception as e:
             print(f"⚠️  Failed to load service account from GOOGLE_SERVICE_ACCOUNT_JSON: {e}")
             print(f"   Error type: {type(e).__name__}")
-            print(f"   💡 TIP: Use GOOGLE_SERVICE_ACCOUNT_FILE=config/google_credentials.json instead")
-            print(f"   📖 See backend/FIX_GOOGLE_DRIVE_NOW.md for help")
-            print("   Trying file-based method...")
+            print(f"   💡 Make sure GOOGLE_SERVICE_ACCOUNT_JSON is set correctly in your .env file")
+            print(f"   📖 The JSON should be a single-line string with escaped quotes")
     
     # Check for base64 variant
     base64_json = os.getenv('GOOGLE_SERVICE_ACCOUNT_JSON_BASE64')
@@ -469,70 +472,7 @@ def get_google_credentials(credentials_path: str = None, token_path: str = None)
             print(f"Warning: Failed to load service account from GOOGLE_SERVICE_ACCOUNT_JSON_BASE64: {e}")
             print("Trying other methods...")
     
-    # Priority 2: Service account file path from environment variable
-    service_account_file = os.getenv('GOOGLE_SERVICE_ACCOUNT_FILE')
-    if service_account_file:
-        # Resolve relative paths relative to backend directory
-        if not os.path.isabs(service_account_file):
-            backend_dir = os.path.dirname(os.path.dirname(__file__))
-            service_account_file = os.path.join(backend_dir, service_account_file)
-        
-        if os.path.exists(service_account_file):
-            try:
-                creds = service_account.Credentials.from_service_account_file(
-                    service_account_file,
-                    scopes=OAUTH_SCOPES
-                )
-                print(f"✅ Loaded Google credentials from file: {service_account_file}")
-                return creds
-            except Exception as e:
-                print(f"⚠️  Failed to load service account from file {service_account_file}: {e}")
-                print("   Trying default file location...")
-        else:
-            print(f"⚠️  GOOGLE_SERVICE_ACCOUNT_FILE specified but file not found: {service_account_file}")
-    
-    # Try default service account file location
-    backend_dir = os.path.dirname(os.path.dirname(__file__))
-    default_service_account = os.path.join(backend_dir, 'config', 'google_credentials.json')
-    if os.path.exists(default_service_account):
-        try:
-            creds = service_account.Credentials.from_service_account_file(
-                default_service_account,
-                scopes=OAUTH_SCOPES
-            )
-            print(f"✅ Loaded Google credentials from default file: {default_service_account}")
-            
-            # Try to validate credentials by attempting to refresh
-            try:
-                from google.auth.transport.requests import Request
-                if not creds.valid:
-                    creds.refresh(Request())
-                print(f"✅ Google credentials validated successfully")
-                return creds
-            except Exception as refresh_error:
-                error_msg = str(refresh_error)
-                if 'invalid_grant' in error_msg or 'JWT' in error_msg or 'signature' in error_msg:
-                    print(f"❌ CRITICAL: Invalid JWT Signature in credentials file!")
-                    print(f"   The service account key is invalid or has been regenerated.")
-                    print(f"   SOLUTION: Regenerate the key in Google Cloud Console")
-                    print(f"   See: backend/FIX_INVALID_JWT_SIGNATURE.md for instructions")
-                    print(f"   Service Account: {creds.service_account_email if hasattr(creds, 'service_account_email') else 'unknown'}")
-                else:
-                    print(f"⚠️  Failed to validate credentials: {refresh_error}")
-                # Don't return None yet - let it try OAuth flow
-                raise refresh_error
-            
-        except Exception as e:
-            error_msg = str(e)
-            if 'invalid_grant' in error_msg or 'JWT' in error_msg or 'signature' in error_msg:
-                print(f"❌ CRITICAL: Invalid JWT Signature!")
-                print(f"   Your service account key needs to be regenerated.")
-                print(f"   📖 See: backend/FIX_INVALID_JWT_SIGNATURE.md")
-            else:
-                print(f"⚠️  Failed to load service account from default file: {e}")
-            print("   Trying OAuth flow...")
-    
-    # Priority 3: OAuth credentials from environment variables
+    # Priority 2: OAuth credentials from environment variables
     oauth_credentials_json = os.getenv('GOOGLE_OAUTH_CREDENTIALS_JSON')
     oauth_token_json = os.getenv('GOOGLE_OAUTH_TOKEN_JSON')
     
@@ -551,8 +491,8 @@ def get_google_credentials(credentials_path: str = None, token_path: str = None)
                         {**creds_data, **token_data},
                         scopes=OAUTH_SCOPES
                     )
-                except Exception:
-                    pass
+            except Exception:
+                pass
             
             # If no valid token, need to do OAuth flow (interactive)
             if not creds or not creds.valid:
@@ -568,51 +508,6 @@ def get_google_credentials(credentials_path: str = None, token_path: str = None)
         except Exception as e:
             print(f"Warning: Failed to load OAuth credentials from env vars: {e}")
     
-    # Priority 4: Fallback to file-based (for backward compatibility during migration)
-    backend_dir = os.path.dirname(os.path.dirname(__file__))
-    default_service_account = os.path.join(backend_dir, 'config', 'google_credentials.json')
-    
-    if credentials_path is None:
-        credentials_path = os.path.join(backend_dir, 'config', 'credentials.json')
-    if token_path is None:
-        token_path = os.path.join(backend_dir, 'config', 'token.json')
-    
-    # Try default service account file
-    if os.path.exists(default_service_account):
-        try:
-            creds = service_account.Credentials.from_service_account_file(
-                default_service_account,
-                scopes=OAUTH_SCOPES
-            )
-            return creds
-        except Exception as e:
-            print(f"Warning: Failed to load service account from default file: {e}")
-    
-    # Fall back to OAuth file flow (interactive - not suitable for production)
-    creds = None
-    token_file = Path(token_path)
-    if token_file.exists():
-        try:
-            creds = pickle.loads(token_file.read_bytes())
-        except Exception:
-            pass
-    
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            try:
-                creds.refresh(Request())
-            except Exception:
-                creds = None
-        
-        if not creds and os.path.exists(credentials_path):
-            try:
-                flow = InstalledAppFlow.from_client_secrets_file(credentials_path, OAUTH_SCOPES)
-                creds = flow.run_local_server(port=0)
-                token_file.write_bytes(pickle.dumps(creds))
-            except Exception as e:
-                print(f"Warning: OAuth flow failed: {e}")
-                return None
-    
     # Final check: if we still don't have valid credentials, print helpful error
     if not creds:
         print()
@@ -622,16 +517,18 @@ def get_google_credentials(credentials_path: str = None, token_path: str = None)
         print()
         print("No valid Google credentials could be loaded.")
         print()
-        print("SOLUTIONS:")
-        print("1. Regenerate service account key (RECOMMENDED):")
+        print("SETUP INSTRUCTIONS:")
+        print("1. Service Account (REQUIRED for production):")
         print("   - Go to: https://console.cloud.google.com/iam-admin/serviceaccounts")
-        print("   - Find: turbo-alan-google-drive@crack-petal-469722-d1.iam.gserviceaccount.com")
-        print("   - Create new JSON key and save to: backend/config/google_credentials.json")
+        print("   - Find your service account and create a new JSON key")
+        print("   - Copy the entire JSON content and set it in your .env file:")
+        print("   GOOGLE_SERVICE_ACCOUNT_JSON='{\"type\":\"service_account\",...}'")
         print()
-        print("2. Or set GOOGLE_SERVICE_ACCOUNT_FILE in .env:")
-        print("   GOOGLE_SERVICE_ACCOUNT_FILE=config/google_credentials.json")
+        print("2. Or use base64 encoding:")
+        print("   GOOGLE_SERVICE_ACCOUNT_JSON_BASE64=<base64-encoded-json>")
         print()
-        print("📖 See: backend/FIX_INVALID_JWT_SIGNATURE.md for detailed instructions")
+        print("NOTE: File-based credentials are no longer supported for security reasons.")
+        print("      Use environment variables instead.")
         print("=" * 70)
         print()
     
@@ -833,7 +730,7 @@ def create_google_doc(title: str, content: str = "") -> str:
                 }]}
             ).execute()
         
-        return doc_id
+    return doc_id
     except Exception as e:
         raise ValueError(f"Failed to create Google Doc: {e}")
 
