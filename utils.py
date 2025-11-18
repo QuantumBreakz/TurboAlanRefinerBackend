@@ -603,15 +603,15 @@ def get_google_credentials(credentials_path: str = None, token_path: str = None)
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
             try:
-            creds.refresh(Request())
+                creds.refresh(Request())
             except Exception:
                 creds = None
         
         if not creds and os.path.exists(credentials_path):
             try:
-            flow = InstalledAppFlow.from_client_secrets_file(credentials_path, OAUTH_SCOPES)
-            creds = flow.run_local_server(port=0)
-        token_file.write_bytes(pickle.dumps(creds))
+                flow = InstalledAppFlow.from_client_secrets_file(credentials_path, OAUTH_SCOPES)
+                creds = flow.run_local_server(port=0)
+                token_file.write_bytes(pickle.dumps(creds))
             except Exception as e:
                 print(f"Warning: OAuth flow failed: {e}")
                 return None
