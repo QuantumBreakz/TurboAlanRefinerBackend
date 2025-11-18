@@ -554,8 +554,8 @@ def get_google_credentials(credentials_path: str = None, token_path: str = None)
                         {**creds_data, **token_data},
                         scopes=OAUTH_SCOPES
                     )
-            except Exception:
-                pass
+                except Exception:
+                    pass
             
             # If no valid token, need to do OAuth flow (interactive)
             if not creds or not creds.valid:
@@ -596,7 +596,7 @@ def get_google_credentials(credentials_path: str = None, token_path: str = None)
     token_file = Path(token_path)
     if token_file.exists():
         try:
-        creds = pickle.loads(token_file.read_bytes())
+            creds = pickle.loads(token_file.read_bytes())
         except Exception:
             pass
     
