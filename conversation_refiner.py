@@ -65,10 +65,11 @@ class ConversationalRefiner:
         return flags
 
     def get_advanced_strategy_insight(self) -> str:
-        lines = ["🎯 **Turbo Alan Strategy Modes:**\n"]
+        lines = ["🎯 Turbo Alan Strategy Modes:\n"]
         for k, v in ADVANCED_COMMANDS.items():
             desc = v.get("description") if isinstance(v, dict) else str(v)
-            lines.append(f"• `{k}` — {desc}")
+            friendly_name = k.replace('_', ' ').title()
+            lines.append(f"• {friendly_name} — {desc}")
         lines.append("\nType /schema to view these again, or ask about any control.")
         return "\n".join(lines)
 
@@ -275,24 +276,24 @@ class ConversationalRefiner:
         level_info = info.get('levels', {}).get(level or 0, '')
         
         response_parts = [
-            f"**{friendly_name}** {level_note if level is not None else ''}",
+            f"{friendly_name} {level_note if level is not None else ''}",
             f"\n{desc}",
         ]
         
         if info:
-            response_parts.append(f"\n\n**What it does:** {info.get('what', '')}")
-            response_parts.append(f"\n**How it works:** {info.get('how', '')}")
-            response_parts.append(f"\n**When to use:** {info.get('when', '')}")
+            response_parts.append(f"\n\nWhat it does: {info.get('what', '')}")
+            response_parts.append(f"\nHow it works: {info.get('how', '')}")
+            response_parts.append(f"\nWhen to use: {info.get('when', '')}")
             if level_info:
-                response_parts.append(f"\n**Current level ({level or 0}):** {level_info}")
+                response_parts.append(f"\nCurrent level ({level or 0}): {level_info}")
         
-        response_parts.append(f"\n\n**Category:** {category.title()}")
+        response_parts.append(f"\n\nCategory: {category.title()}")
         
         return ''.join(response_parts)
 
     def describe_all_schemas(self, schema_levels: dict | None) -> str:
         levels = {str(k): int(v) for k, v in (schema_levels or {}).items() if isinstance(v, (int, float))}
-        lines = ["📊 **Current Schema Overview:**\n"]
+        lines = ["📊 Current Schema Overview:\n"]
         for sid in ADVANCED_COMMANDS.keys():
             lines.append(self.describe_schema(sid, levels.get(sid)))
         return "\n".join(lines)
@@ -301,11 +302,12 @@ class ConversationalRefiner:
         if not flags:
             return "No schema flags are currently active. Enable some toggles or pass flags to activate strategy modes."
 
-        lines = ["🧠 **Turbo Alan Active Strategy:**\n"]
+        lines = ["🧠 Turbo Alan Active Strategy:\n"]
         for key in flags:
             if key in ADVANCED_COMMANDS:
                 desc = ADVANCED_COMMANDS[key]["description"]
-                lines.append(f"• `{key}` — {desc}")
+                friendly_name = key.replace('_', ' ').title()
+                lines.append(f"• {friendly_name} — {desc}")
         return "\n".join(lines)
 
     def _safe_chat_completion(self, messages, model: str = "gpt-4", temperature: float = 0.7, timeout_seconds: int = 30) -> str:
