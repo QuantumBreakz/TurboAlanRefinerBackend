@@ -327,6 +327,37 @@ class ConversationalRefiner:
         except Exception:
             return "The chat request failed while contacting the model. Please try again later."
 
+    def _is_direct_schema_query(self, message: str) -> str | None:
+        """Check if the message is a direct schema name query (e.g., just 'microstructure control')."""
+        mlow = message.strip().lower()
+        
+        # Check if message is exactly or closely matches a schema name
+        for sid in ADVANCED_COMMANDS.keys():
+            # Exact match with schema ID
+            if mlow == sid or mlow == sid.replace('_', ' '):
+                return sid
+            
+            # Exact match with friendly name
+            friendly_name = sid.replace('_', ' ').title().lower()
+            if mlow == friendly_name:
+                return sid
+            
+            # Check if message is just the schema name (allowing for minor variations)
+            # Remove common words and check if it's mostly the schema name
+            cleaned = mlow.replace('what is', '').replace('tell me about', '').replace('explain', '').strip()
+            if cleaned == sid or cleaned == sid.replace('_', ' ') or cleaned == friendly_name:
+                return sid
+        
+        # Try normalized matching
+        normalized = self._normalize_schema_name(mlow)
+        if normalized:
+            # Check if the normalized result is close to the original message
+            normalized_friendly = normalized.replace('_', ' ').title().lower()
+            if mlow == normalized_friendly or mlow == normalized.replace('_', ' '):
+                return normalized
+        
+        return None
+
     def chat(self, message, flags=None):
         # Extract context from the message
         self.extract_context_from_message(message)
@@ -335,6 +366,12 @@ class ConversationalRefiner:
         mlow = (message or '').strip().lower()
         if self.is_schema_request(mlow):
             return self.get_advanced_strategy_insight()
+        
+        # Check if message is a direct schema name query (e.g., just "microstructure control")
+        direct_schema = self._is_direct_schema_query(message)
+        if direct_schema:
+            return self.describe_schema(direct_schema, getattr(self, 'schema_levels', {}).get(direct_schema))
+        
         # Explain single schema: "explain <schema>", "what is <schema>", "tell me about <schema>", etc.
         schema_query_patterns = ['explain', 'what is', 'tell me about', 'describe', 'how does', 'what does', 'information about']
         if any(pattern in mlow for pattern in schema_query_patterns):
