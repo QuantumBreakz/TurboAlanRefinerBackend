@@ -26,6 +26,7 @@ PyYAML==6.0.2
 # Utilities
 aiofiles==24.1.0
 requests==2.32.4
+supabase==2.10.0
 
 # Optional: For academic humanizer (if used)
 # nltk==3.9.1

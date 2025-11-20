@@ -135,7 +135,7 @@ class _Analytics:
             logger.warning(f"Failed to save analytics to disk: {e}", exc_info=True)
             # Don't fail the request if persistence fails
 
-    def add(self, in_tokens: int, out_tokens: int, model: str = "gpt-4", job_id: str = None) -> dict:
+    def add(self, in_tokens: int, out_tokens: int, model: str = "gpt-4", job_id: str = None, user_id: str = None) -> dict:
         now = int(time.time())
         self.total_requests += 1
         self.total_tokens_in += max(0, in_tokens)
@@ -155,6 +155,34 @@ class _Analytics:
             self.pass_costs[job_id].append(cost_info['total_cost'])
         
         self.events.append((now, in_tokens, out_tokens, model, cost_info['total_cost']))
+        
+        # Store to Supabase (non-blocking, in background thread)
+        if user_id:
+            try:
+                import threading
+                from core.supabase_analytics import store_usage_stats
+                # Run in background thread to avoid blocking
+                def _store():
+                    try:
+                        success = store_usage_stats(
+                            user_id=user_id,
+                            request_count=1,
+                            tokens_in=max(0, in_tokens),
+                            tokens_out=max(0, out_tokens),
+                            cost=cost_info['total_cost'],
+                            model=model,
+                            job_id=job_id
+                        )
+                        if not success:
+                            logger.debug(f"Supabase storage returned False for user_id={user_id}")
+                    except Exception as e:
+                        logger.warning(f"Exception in Supabase storage thread: {e}")
+                thread = threading.Thread(target=_store, daemon=True)
+                thread.start()
+            except Exception as e:
+                # Don't fail the request if Supabase storage fails
+                logger = logging.getLogger(__name__)
+                logger.debug(f"Failed to start Supabase storage thread: {e}")
         
         # Persist to disk after each update (async, non-blocking)
         try:
@@ -198,11 +226,29 @@ class _Analytics:
             "avg_cost_per_pass": total_cost / max(len(pass_costs), 1)
         }
     
-    def track_schema_usage(self, schema_id: str, schema_level: int) -> None:
+    def track_schema_usage(self, schema_id: str, schema_level: int, user_id: str = None) -> None:
         """Track schema usage for analytics"""
         if schema_level > 0:  # Only track active schemas
             self.schema_usage[schema_id] = self.schema_usage.get(schema_id, 0) + 1
             self.schema_last_used[schema_id] = datetime.now().isoformat()
+            
+            # Store to Supabase (non-blocking, in background thread)
+            if user_id:
+                try:
+                    import threading
+                    from core.supabase_analytics import store_schema_usage
+                    def _store():
+                        try:
+                            success = store_schema_usage(user_id, schema_id)
+                            if not success:
+                                logger.debug(f"Supabase schema storage returned False for user_id={user_id}, schema={schema_id}")
+                        except Exception as e:
+                            logger.warning(f"Exception in Supabase schema storage thread: {e}")
+                    thread = threading.Thread(target=_store, daemon=True)
+                    thread.start()
+                except Exception as e:
+                    logger.debug(f"Failed to start Supabase schema storage thread: {e}")
+            
             # Persist to disk
             try:
                 self._save_to_disk()
@@ -239,7 +285,7 @@ class OpenAIModel:
         self.client = OpenAI(api_key=api_key)
         self.model = model
 
-    def generate(self, system: str, user: str, temperature: float = 0.4, max_tokens: int = 2000, job_id: str = None) -> tuple[str, dict]:
+    def generate(self, system: str, user: str, temperature: float = 0.4, max_tokens: int = 2000, job_id: str = None, user_id: str = None) -> tuple[str, dict]:
         t0 = time.perf_counter()
         
         def _estimate_max_chars_for_model(model: str, max_input_tokens: int = 7000) -> int:
@@ -335,10 +381,10 @@ class OpenAIModel:
             model_name = "gpt-3.5-turbo"
         
         # Track cost and return cost information
-        cost_info = analytics_store.add(used_in, used_out, model_name, job_id)
+        cost_info = analytics_store.add(used_in, used_out, model_name, job_id, user_id)
         
         # Log analytics tracking
-        logger.debug(f"Analytics tracked: {used_in} in, {used_out} out tokens, cost=${cost_info['total_cost']:.6f}, model={model_name}, job_id={job_id}")
+        logger.debug(f"Analytics tracked: {used_in} in, {used_out} out tokens, cost=${cost_info['total_cost']:.6f}, model={model_name}, job_id={job_id}, user_id={user_id}")
         
         return content, cost_info
 

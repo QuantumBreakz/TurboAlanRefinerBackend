@@ -2063,7 +2063,8 @@ async def _refine_stream(request: RefinementRequest, job_id: str) -> AsyncGenera
                             output_sink=output_sink,
                             drive_title_base=Path(file_path).stem,
                             heuristics_overrides=request.heuristics,
-                            job_id=job_id
+                            job_id=job_id,
+                            user_id=request.user_id if hasattr(request, 'user_id') else None
                         )
                         print(f"DEBUG: pipeline.run_pass completed for pass {pass_num}")
                     except Exception as e:
@@ -3611,13 +3612,85 @@ class DiffRequest(BaseModel):
 
 
 @app.get("/analytics/summary")
-async def get_analytics_summary():
-    """Get comprehensive analytics summary, including live OpenAI usage."""
+async def get_analytics_summary(user_id: Optional[str] = None):
+    """Get comprehensive analytics summary, including live OpenAI usage.
+    
+    Args:
+        user_id: Optional user UUID to filter analytics by user. If not provided, returns aggregate stats for all users.
+    """
     logger = logging.getLogger(__name__)
     try:
-        logger.debug(f"Analytics endpoint called: requests={analytics_store.total_requests}, cost=${analytics_store.total_cost:.6f}")
+        logger.debug(f"Analytics endpoint called: requests={analytics_store.total_requests}, cost=${analytics_store.total_cost:.6f}, user_id={user_id}")
+        
+        # Get Supabase analytics (persistent, user-specific)
+        from core.supabase_analytics import get_aggregate_analytics, get_schema_usage_stats
+        supabase_openai = get_aggregate_analytics(user_id)
+        supabase_schema = get_schema_usage_stats(user_id)
+        
+        # Get in-memory analytics (real-time, all users)
+        in_memory_openai = {
+            "total_requests": analytics_store.total_requests,
+            "total_tokens_in": analytics_store.total_tokens_in,
+            "total_tokens_out": analytics_store.total_tokens_out,
+            "total_cost": analytics_store.total_cost,
+            "current_model": analytics_store.current_model,
+            "last_24h": analytics_store.summary_last_24h(),
+        }
+        in_memory_schema = analytics_store.get_schema_usage_stats()
+        
+        # Merge Supabase and in-memory data
+        # For aggregate (no user_id), combine both sources
+        # For user-specific (with user_id), prefer Supabase but include in-memory for recent activity
+        if user_id:
+            # User-specific: use Supabase as primary, in-memory as fallback
+            merged_openai = {
+                "total_requests": supabase_openai.get("total_requests", 0) or in_memory_openai["total_requests"],
+                "total_tokens_in": supabase_openai.get("total_tokens_in", 0) or in_memory_openai["total_tokens_in"],
+                "total_tokens_out": supabase_openai.get("total_tokens_out", 0) or in_memory_openai["total_tokens_out"],
+                "total_cost": supabase_openai.get("total_cost", 0.0) or in_memory_openai["total_cost"],
+                "current_model": supabase_openai.get("current_model") or in_memory_openai["current_model"],
+                "last_24h": in_memory_openai["last_24h"],  # Use in-memory for real-time 24h data
+            }
+            merged_schema = supabase_schema if supabase_schema else in_memory_schema
+        else:
+            # Aggregate: combine both sources
+            merged_openai = {
+                "total_requests": supabase_openai.get("total_requests", 0) + in_memory_openai["total_requests"],
+                "total_tokens_in": supabase_openai.get("total_tokens_in", 0) + in_memory_openai["total_tokens_in"],
+                "total_tokens_out": supabase_openai.get("total_tokens_out", 0) + in_memory_openai["total_tokens_out"],
+                "total_cost": supabase_openai.get("total_cost", 0.0) + in_memory_openai["total_cost"],
+                "current_model": in_memory_openai["current_model"],  # Use in-memory for current model
+                "last_24h": in_memory_openai["last_24h"],
+            }
+            # Merge schema usage
+            merged_schema = {
+                "total_usages": (supabase_schema.get("total_usages", 0) or 0) + (in_memory_schema.get("total_usages", 0) or 0),
+                "most_used_schema": in_memory_schema.get("most_used_schema") or supabase_schema.get("most_used_schema"),
+                "most_used_count": max(
+                    in_memory_schema.get("most_used_count", 0) or 0,
+                    supabase_schema.get("most_used_count", 0) or 0
+                ),
+                "least_used_schema": in_memory_schema.get("least_used_schema") or supabase_schema.get("least_used_schema"),
+                "least_used_count": min(
+                    in_memory_schema.get("least_used_count", 0) or 0,
+                    supabase_schema.get("least_used_count", 0) or 0
+                ),
+                "average_usage": 0,  # Will calculate below
+                "schema_usage": {**in_memory_schema.get("schema_usage", {}), **supabase_schema.get("schema_usage", {})},
+                "schema_last_used": {**in_memory_schema.get("schema_last_used", {}), **supabase_schema.get("schema_last_used", {})},
+            }
+            # Calculate average
+            schema_counts = merged_schema["schema_usage"]
+            merged_schema["average_usage"] = sum(schema_counts.values()) / len(schema_counts) if schema_counts else 0
+        
         # Get all jobs from database
         jobs = list_jobs(1000)  # Get last 1000 jobs
+        
+        # Filter jobs by user_id if provided
+        if user_id:
+            # Note: jobs don't currently store user_id, so we'll return all jobs for now
+            # TODO: Add user_id to jobs table
+            pass
         
         # Calculate basic metrics
         total_jobs = len(jobs)
@@ -3668,17 +3741,10 @@ async def get_analytics_summary():
                     for job in recent_activity
                 ]
             },
-            "openai": {
-                "total_requests": analytics_store.total_requests,
-                "total_tokens_in": analytics_store.total_tokens_in,
-                "total_tokens_out": analytics_store.total_tokens_out,
-                "total_cost": analytics_store.total_cost,
-                "current_model": analytics_store.current_model,
-                "last_24h": analytics_store.summary_last_24h(),
-            },
-            "schema_usage": analytics_store.get_schema_usage_stats()
+            "openai": merged_openai,
+            "schema_usage": merged_schema
         }
-        logger.debug(f"Returning analytics: requests={result['openai']['total_requests']}, cost=${result['openai']['total_cost']:.6f}")
+        logger.debug(f"Returning analytics: requests={result['openai']['total_requests']}, cost=${result['openai']['total_cost']:.6f}, user_id={user_id}")
         return JSONResponse(result)
     except Exception as e:
         from logger import log_exception

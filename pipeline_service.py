@@ -163,6 +163,7 @@ class RefinementPipeline:
         drive_title_base: str | None = None,
         heuristics_overrides: dict | None = None,
         job_id: str | None = None,
+        user_id: str | None = None,
     ) -> Tuple[PassState, RunResult, str]:
         print(f"PIPELINE: run_pass started for pass {pass_index}")
         
@@ -173,7 +174,7 @@ class RefinementPipeline:
                 schema_levels = heuristics_overrides['schemaLevels']
                 if isinstance(schema_levels, dict):
                     for schema_id, schema_level in schema_levels.items():
-                        analytics_store.track_schema_usage(schema_id, int(schema_level))
+                        analytics_store.track_schema_usage(schema_id, int(schema_level), user_id)
         except Exception as e:
             print(f"PIPELINE: Failed to track schema usage: {e}")
         
@@ -252,11 +253,14 @@ class RefinementPipeline:
             refined = p1  # no change in dry run
             macro_results = {}  # No macro results in dry run
         else:
-            # Set job_id for cost tracking
+            # Set job_id and user_id for cost tracking
             if job_id:
                 self._current_job_id = job_id
-                self._pass_costs = []  # Reset costs for this pass
-            else:
+            if user_id:
+                self._current_user_id = user_id
+            # Always initialize/reset _pass_costs for each pass
+            self._pass_costs = []  # Reset costs for this pass
+            if not job_id:
                 import logging
                 logger = logging.getLogger(__name__)
                 logger.warning(f"No job_id provided for pass {pass_index}")
@@ -1011,7 +1015,7 @@ class RefinementPipeline:
             user2 = user + "\nAlso provide a JSON object named STRATEGY_SLOTS with keys: primary_strategy, secondary_strategy, modulators (array)."
             print(f"_analyze_strategy: Calling LLM for strategy analysis")
             # Handle tuple return from generate() method
-            result = self.model.generate(system=system, user=user2, temperature=0.15, max_tokens=500, job_id=getattr(self, '_current_job_id', None))
+            result = self.model.generate(system=system, user=user2, temperature=0.15, max_tokens=500, job_id=getattr(self, '_current_job_id', None), user_id=getattr(self, '_current_user_id', None))
             if isinstance(result, tuple):
                 strategy_text, cost_info = result
                 # Track cost for strategy analysis
@@ -1313,7 +1317,7 @@ class RefinementPipeline:
                     pass
 
                 if hasattr(self, '_current_job_id') and self._current_job_id:
-                    gen_txt, cost_info = self.model.generate(system=sys_full, user=payload, temperature=temp, max_tokens=2000, job_id=self._current_job_id)
+                    gen_txt, cost_info = self.model.generate(system=sys_full, user=payload, temperature=temp, max_tokens=2000, job_id=self._current_job_id, user_id=getattr(self, '_current_user_id', None))
                     if not hasattr(self, '_pass_costs'):
                         self._pass_costs = []
                     self._pass_costs.append(cost_info)
@@ -1325,11 +1329,17 @@ class RefinementPipeline:
                     import logging
                     logger = logging.getLogger(__name__)
                     logger.debug("No _current_job_id, calling model.generate without job_id")
-                    result = self.model.generate(system=sys_full, user=payload, temperature=temp, max_tokens=2000)
+                    result = self.model.generate(system=sys_full, user=payload, temperature=temp, max_tokens=2000, user_id=getattr(self, '_current_user_id', None))
                     if isinstance(result, tuple):
                         gen_txt, cost_info = result
+                        # Still track costs even without job_id
+                        if not hasattr(self, '_pass_costs'):
+                            self._pass_costs = []
+                        self._pass_costs.append(cost_info)
                     else:
                         gen_txt = result
+                        # If no cost_info returned, create empty one
+                        cost_info = {'total_cost': 0, 'tokens_in': 0, 'tokens_out': 0}
 
                 if self.enable_placeholders and ph_map:
                     try:
