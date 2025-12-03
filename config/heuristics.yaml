@@ -1,0 +1,55 @@
+# heuristics.yaml — full (original settings + layout preservation)
+
+# Keep paragraph breaks and heading lines intact in the pipeline
+preserve_layout: true
+
+# ── Transform weights at AI-score ≥ 49% (aggressiveness = 0) ────────────
+# As aggressiveness → 1, each weight scales linearly toward 1.0
+transforms:
+  punctuation:    0.2
+  splits:         0.2
+  transitions:    0.2
+  rhythm:         0.2
+  keywords:       0.2
+  grammar:        0.2
+  synonyms:       0.2
+  micro_degrade:  0.2
+
+# ── Paragraph re-chunking settings ────────────────────────────────────
+paragraph:
+  min_sentences: 1
+  max_sentences: 6
+
+# ── Target length controls ────────────────────────────────────────────
+length:
+  ratio_range: [0.9, 1.1]
+
+# ── Sampling defaults ─────────────────────────────────────────────────
+sampling:
+  temperature: 0.5
+  top_p: 0.9
+
+# Schedules applied per pass (indices align with phases below)
+sampling_schedule: [0.5, 0.45, 0.4]
+top_p_schedule:   [0.9, 0.81, 0.729]
+
+# ── Synonym / grammar / micro‑degradation transformer configs ─────────
+synonym: {}
+grammar: {}
+micro_degrade: {}
+
+# ── Phases (prompt scaffolding) ───────────────────────────────────────
+phases:
+  - >-
+    You are Turbo Alan Refiner. Apply micro-degradation transformations to
+    reduce AI-detection signals while preserving coherence.
+  - >-
+    You are Turbo Alan Refiner. Further vary punctuation, sentence length,
+    and word choice to evade scanners without harming readability.
+  - >-
+    You are Turbo Alan Refiner. Final pass: introduce subtle noise patterns,
+    minor inconsistencies, and ensure the output reads naturally.
+
+# ── Estimated duration for progress‑bar (seconds) ──────────────────────
+duration_estimate: 60.0
+
