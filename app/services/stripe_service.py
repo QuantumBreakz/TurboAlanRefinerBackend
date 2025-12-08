@@ -37,11 +37,14 @@ class StripeService:
         api_key = stripe.api_key
         if not api_key:
             return False
-        # Basic validation - Stripe keys start with sk_ (secret) or pk_ (public)
-        if isinstance(api_key, str) and (api_key.startswith("sk_") or api_key.startswith("pk_")):
+        # Basic validation - Backend should use secret keys (sk_)
+        # Test keys start with sk_test_, live keys start with sk_live_
+        if isinstance(api_key, str) and api_key.startswith("sk_"):
             return True
-        logger.warning(f"Stripe API key format appears invalid (should start with sk_ or pk_)")
-        return False
+        # Log warning but don't block - let Stripe API calls fail naturally if key is invalid
+        if isinstance(api_key, str) and not api_key.startswith("sk_"):
+            logger.warning(f"Stripe API key format appears invalid (should start with sk_ for secret keys)")
+        return bool(api_key)  # Return True if key exists, let Stripe API validate it
     
     @staticmethod
     def get_stripe_client() -> Optional[stripe.Stripe]:
@@ -70,9 +73,9 @@ class StripeService:
             return None
         
         try:
-            # Check MongoDB connection
-            if not db.db:
-                logger.error("MongoDB database connection is not available")
+            # Check MongoDB connection (use 'is None' instead of boolean check)
+            if db.db is None:
+                logger.warning("MongoDB database connection is not available - continuing without DB storage")
                 # Continue anyway - we can still create Stripe customer without storing in DB
             
             # Check if customer already exists in our database
@@ -149,7 +152,7 @@ class StripeService:
     @staticmethod
     def get_customer_by_user_id(user_id: str) -> Optional[Dict[str, Any]]:
         """Get customer record from MongoDB by user ID."""
-        if not db.db:
+        if db.db is None:
             logger.debug("MongoDB database not available for customer lookup")
             return None
         
@@ -166,7 +169,7 @@ class StripeService:
     @staticmethod
     def _store_customer(user_id: str, stripe_customer_id: str, email: str, name: Optional[str] = None) -> bool:
         """Store customer record in MongoDB."""
-        if not db.db:
+        if db.db is None:
             return False
         
         try:
@@ -385,7 +388,7 @@ class StripeService:
     @staticmethod
     def get_active_subscription(user_id: str) -> Optional[Dict[str, Any]]:
         """Get active subscription for a user."""
-        if not db.db:
+        if db.db is None:
             return None
         
         try:
@@ -416,7 +419,7 @@ class StripeService:
         metadata: Optional[Dict[str, Any]] = None
     ) -> bool:
         """Store subscription in MongoDB."""
-        if not db.db:
+        if db.db is None:
             return False
         
         try:
@@ -454,7 +457,7 @@ class StripeService:
         cancel_at_period_end: Optional[bool] = None
     ) -> bool:
         """Update subscription status in MongoDB and user plan."""
-        if not db.db:
+        if db.db is None:
             return False
         
         try:
@@ -500,7 +503,7 @@ class StripeService:
             price_id: Stripe price ID (optional, to determine plan name)
             plan_name_from_metadata: Plan name from metadata (optional, takes priority)
         """
-        if not db.db:
+        if db.db is None:
             return False
         
         try:
@@ -555,7 +558,7 @@ class StripeService:
     @staticmethod
     def get_payment_history(user_id: str, limit: int = 10) -> List[Dict[str, Any]]:
         """Get payment history for a user."""
-        if not db.db:
+        if db.db is None:
             return []
         
         try:
@@ -587,7 +590,7 @@ class StripeService:
         metadata: Optional[Dict[str, Any]] = None
     ) -> bool:
         """Store payment record in MongoDB."""
-        if not db.db:
+        if db.db is None:
             return False
         
         try:

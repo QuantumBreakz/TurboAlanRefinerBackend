@@ -4,6 +4,7 @@ Professional Stripe integration endpoints for subscriptions and payments.
 """
 from __future__ import annotations
 
+import os
 from typing import Optional, Dict, Any
 from fastapi import APIRouter, HTTPException, Header, Request
 from pydantic import BaseModel, EmailStr
@@ -58,14 +59,51 @@ async def create_checkout_session(request: CreateCheckoutRequest):
     try:
         # Create or get customer
         logger.info(f"Creating checkout session for user {request.user_id}, email: {request.email}")
-        customer = stripe_service.create_or_get_customer(
-            email=request.email,
-            user_id=request.user_id,
-            name=request.name
-        )
+        
+        # Check if Stripe is configured
+        import stripe as stripe_module
+        stripe_api_key = os.getenv("STRIPE_SECRET_KEY")
+        
+        if not stripe_api_key:
+            error_msg = "Stripe is not configured. STRIPE_SECRET_KEY environment variable is missing."
+            logger.error(error_msg)
+            raise HTTPException(
+                status_code=503,
+                detail=error_msg
+            )
+        
+        if not stripe_api_key.startswith("sk_"):
+            error_msg = f"Invalid Stripe API key format. Key should start with 'sk_' (secret key). Current key starts with: {stripe_api_key[:3] if len(stripe_api_key) >= 3 else 'unknown'}"
+            logger.error(error_msg)
+            raise HTTPException(
+                status_code=503,
+                detail=error_msg
+            )
+        
+        if not stripe_service.is_configured():
+            error_msg = "Stripe is not properly configured. Check STRIPE_SECRET_KEY environment variable."
+            logger.error(error_msg)
+            raise HTTPException(
+                status_code=503,
+                detail=error_msg
+            )
+        
+        try:
+            customer = stripe_service.create_or_get_customer(
+                email=request.email,
+                user_id=request.user_id,
+                name=request.name
+            )
+        except Exception as e:
+            error_msg = f"Error creating customer: {str(e)}"
+            logger.error(f"{error_msg} User ID: {request.user_id}, Email: {request.email}", exc_info=True)
+            raise HTTPException(
+                status_code=500,
+                detail=error_msg
+            )
         
         if not customer:
-            error_msg = "Failed to create or retrieve customer. Check logs for details."
+            error_msg = "Failed to create or retrieve customer. Possible causes: 1) Invalid Stripe API key, 2) Network/API connectivity issues, 3) Stripe API error. Check backend logs for detailed error information."
             logger.error(f"{error_msg} User ID: {request.user_id}, Email: {request.email}")
             raise HTTPException(
                 status_code=500,
