@@ -408,12 +408,18 @@ from app.api.routes.analytics import router as analytics_router
 from app.api.routes.jobs import router as jobs_router
 from app.api.routes.settings import router as settings_router
 from app.api.routes.schema import router as schema_router
+from app.api.routes.stripe import router as stripe_router
+from app.api.routes.payments import router as payments_router
+from app.api.routes.stripe_prices import router as stripe_prices_router
 
 app.include_router(analytics_router)
 app.include_router(jobs_router)
 app.include_router(settings_router)
 app.include_router(schema_router)
 app.include_router(refine_router, prefix="/refine", tags=["refinement"])
+app.include_router(stripe_router)  # Stripe payment and subscription endpoints
+app.include_router(payments_router)  # Payments webhook endpoint
+app.include_router(stripe_prices_router)  # Stripe price management endpoints
 
 @app.exception_handler(RefinerException)
 async def refiner_exception_handler(request: Request, exc: RefinerException):

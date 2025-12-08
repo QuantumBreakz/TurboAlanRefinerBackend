@@ -152,6 +152,29 @@ class MongoDB:
             system_logs_col.create_index([("created_at", DESCENDING)])
             system_logs_col.create_index([("level", ASCENDING)])
             
+            # Stripe customers collection indexes
+            customers_col = self._db.customers
+            customers_col.create_index([("user_id", ASCENDING)], unique=True)
+            customers_col.create_index([("stripe_customer_id", ASCENDING)], unique=True)
+            customers_col.create_index([("email", ASCENDING)])
+            
+            # Stripe subscriptions collection indexes
+            subscriptions_col = self._db.subscriptions
+            subscriptions_col.create_index([("subscription_id", ASCENDING)], unique=True)
+            subscriptions_col.create_index([("user_id", ASCENDING)])
+            subscriptions_col.create_index([("customer_id", ASCENDING)])
+            subscriptions_col.create_index([("status", ASCENDING)])
+            subscriptions_col.create_index([("created_at", DESCENDING)])
+            
+            # Stripe payments collection indexes
+            payments_col = self._db.payments
+            payments_col.create_index([("payment_intent_id", ASCENDING)], unique=True)
+            payments_col.create_index([("user_id", ASCENDING)])
+            payments_col.create_index([("customer_id", ASCENDING)])
+            payments_col.create_index([("subscription_id", ASCENDING)])
+            payments_col.create_index([("status", ASCENDING)])
+            payments_col.create_index([("created_at", DESCENDING)])
+            
             _safe_log("MongoDB indexes created successfully.")
         except Exception as e:
             _safe_log(f"Failed to create indexes: {e}")
