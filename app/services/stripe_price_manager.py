@@ -8,18 +8,47 @@ from __future__ import annotations
 import os
 import logging
 from typing import Optional, Dict, Any
-import stripe
-from stripe.error import StripeError
+from pathlib import Path
+
+# Load environment variables from .env file
+try:
+    from dotenv import load_dotenv
+    # Try to load .env from backend directory
+    backend_root = Path(__file__).parent.parent.parent
+    env_path = backend_root / ".env"
+    if env_path.exists():
+        load_dotenv(dotenv_path=env_path)
+    else:
+        # Fallback to current directory
+        load_dotenv()
+except ImportError:
+    # dotenv not available, continue without it
+    pass
+
+# Optional Stripe import - allow server to start without stripe installed
+try:
+    import stripe
+    from stripe.error import StripeError
+    STRIPE_AVAILABLE = True
+except ImportError:
+    stripe = None
+    StripeError = Exception
+    STRIPE_AVAILABLE = False
 
 from app.core.logger import get_logger
 
 logger = get_logger('services.stripe_price_manager')
 
-# Initialize Stripe
-stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
-
-if not stripe.api_key:
-    logger.warning("STRIPE_SECRET_KEY not configured. Stripe price manager will not work.")
+# Initialize Stripe only if available
+if STRIPE_AVAILABLE:
+    stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
+    
+    if not stripe.api_key:
+        logger.warning("STRIPE_SECRET_KEY not configured. Stripe price manager will not work.")
+    else:
+        logger.info("Stripe API key configured successfully")
+else:
+    logger.warning("Stripe module not installed. Stripe price manager will be disabled. Install with: pip install stripe")
 
 
 class StripePriceManager:
@@ -89,6 +118,8 @@ class StripePriceManager:
     @staticmethod
     def is_configured() -> bool:
         """Check if Stripe is properly configured."""
+        if not STRIPE_AVAILABLE:
+            return False
         return bool(stripe.api_key)
     
     @staticmethod
@@ -102,6 +133,9 @@ class StripePriceManager:
         Returns:
             Product object or None if failed
         """
+        if not STRIPE_AVAILABLE:
+            logger.error("Stripe module not available")
+            return None
         if not StripePriceManager.is_configured():
             logger.error("Stripe not configured")
             return None
@@ -167,6 +201,9 @@ class StripePriceManager:
         Returns:
             Price ID or None if failed
         """
+        if not STRIPE_AVAILABLE:
+            logger.error("Stripe module not available")
+            return None
         if not StripePriceManager.is_configured():
             logger.error("Stripe not configured")
             return None
@@ -247,6 +284,8 @@ class StripePriceManager:
         Returns:
             True if all plans are properly configured
         """
+        if not STRIPE_AVAILABLE:
+            return False
         if not StripePriceManager.is_configured():
             return False
         

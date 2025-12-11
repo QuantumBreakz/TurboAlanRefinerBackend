@@ -61,7 +61,11 @@ async def create_checkout_session(request: CreateCheckoutRequest):
         logger.info(f"Creating checkout session for user {request.user_id}, email: {request.email}")
         
         # Check if Stripe is configured
-        import stripe as stripe_module
+        try:
+            import stripe as stripe_module
+        except ImportError:
+            raise HTTPException(status_code=503, detail="Stripe module not installed. Please install with: pip install stripe")
+        
         stripe_api_key = os.getenv("STRIPE_SECRET_KEY")
         
         if not stripe_api_key:

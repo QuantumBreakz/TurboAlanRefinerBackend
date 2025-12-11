@@ -9,8 +9,32 @@ import os
 import logging
 from typing import Optional, Dict, Any, List
 from datetime import datetime
-import stripe
-from stripe.error import StripeError
+from pathlib import Path
+
+# Load environment variables from .env file
+try:
+    from dotenv import load_dotenv
+    # Try to load .env from backend directory
+    backend_root = Path(__file__).parent.parent.parent
+    env_path = backend_root / ".env"
+    if env_path.exists():
+        load_dotenv(dotenv_path=env_path)
+    else:
+        # Fallback to current directory
+        load_dotenv()
+except ImportError:
+    # dotenv not available, continue without it
+    pass
+
+# Optional Stripe import - allow server to start without stripe installed
+try:
+    import stripe
+    from stripe.error import StripeError
+    STRIPE_AVAILABLE = True
+except ImportError:
+    stripe = None
+    StripeError = Exception
+    STRIPE_AVAILABLE = False
 
 from app.core.mongodb_db import db
 from app.core.logger import get_logger
@@ -18,12 +42,18 @@ from app.services.email_service import email_service
 
 logger = get_logger('services.stripe')
 
-# Initialize Stripe
-stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
-STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
-
-if not stripe.api_key:
-    logger.warning("STRIPE_SECRET_KEY not configured. Stripe features will be disabled.")
+# Initialize Stripe only if available
+if STRIPE_AVAILABLE:
+    stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
+    STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
+    
+    if not stripe.api_key:
+        logger.warning("STRIPE_SECRET_KEY not configured. Stripe features will be disabled.")
+    else:
+        logger.info("Stripe API key configured successfully")
+else:
+    logger.warning("Stripe module not installed. Stripe features will be disabled. Install with: pip install stripe")
+    STRIPE_WEBHOOK_SECRET = None
 
 
 class StripeService:
@@ -34,6 +64,8 @@ class StripeService:
     @staticmethod
     def is_configured() -> bool:
         """Check if Stripe is properly configured."""
+        if not STRIPE_AVAILABLE:
+            return False
         api_key = stripe.api_key
         if not api_key:
             return False
@@ -47,9 +79,9 @@ class StripeService:
         return bool(api_key)  # Return True if key exists, let Stripe API validate it
     
     @staticmethod
-    def get_stripe_client() -> Optional[stripe.Stripe]:
+    def get_stripe_client() -> Optional[Any]:
         """Get Stripe client instance."""
-        if not StripeService.is_configured():
+        if not STRIPE_AVAILABLE or not StripeService.is_configured():
             return None
         return stripe
     
@@ -68,6 +100,9 @@ class StripeService:
         Returns:
             Customer object or None if failed
         """
+        if not STRIPE_AVAILABLE:
+            logger.error("Stripe module not available")
+            return None
         if not StripeService.is_configured():
             logger.error("Stripe not configured - STRIPE_SECRET_KEY is missing or invalid")
             return None
@@ -614,7 +649,7 @@ class StripeService:
     # --- Webhook Event Handling ---
     
     @staticmethod
-    def construct_webhook_event(payload: bytes, signature: str) -> Optional[stripe.Event]:
+    def construct_webhook_event(payload: bytes, signature: str) -> Optional[Any]:
         """
         Construct and verify a webhook event.
         
@@ -625,6 +660,9 @@ class StripeService:
         Returns:
             Stripe event object or None if verification failed
         """
+        if not STRIPE_AVAILABLE:
+            logger.error("Stripe module not available")
+            return None
         if not StripeService.is_configured() or not STRIPE_WEBHOOK_SECRET:
             logger.error("Stripe webhook secret not configured")
             return None
@@ -644,7 +682,7 @@ class StripeService:
             return None
     
     @staticmethod
-    def handle_webhook_event(event: stripe.Event) -> bool:
+    def handle_webhook_event(event: Any) -> bool:
         """
         Handle a Stripe webhook event.
         
@@ -679,7 +717,7 @@ class StripeService:
             return False
     
     @staticmethod
-    def _handle_checkout_session_completed(event: stripe.Event) -> bool:
+    def _handle_checkout_session_completed(event: Any) -> bool:
         """Handle checkout.session.completed event."""
         try:
             session = event.data.object
@@ -748,7 +786,7 @@ class StripeService:
             return False
     
     @staticmethod
-    def _handle_subscription_created(event: stripe.Event) -> bool:
+    def _handle_subscription_created(event: Any) -> bool:
         """Handle customer.subscription.created event."""
         try:
             subscription = event.data.object
@@ -790,7 +828,7 @@ class StripeService:
             return False
     
     @staticmethod
-    def _handle_subscription_updated(event: stripe.Event) -> bool:
+    def _handle_subscription_updated(event: Any) -> bool:
         """Handle customer.subscription.updated event."""
         try:
             subscription = event.data.object
@@ -809,7 +847,7 @@ class StripeService:
             return False
     
     @staticmethod
-    def _handle_subscription_deleted(event: stripe.Event) -> bool:
+    def _handle_subscription_deleted(event: Any) -> bool:
         """Handle customer.subscription.deleted event."""
         try:
             subscription = event.data.object
@@ -827,7 +865,7 @@ class StripeService:
             return False
     
     @staticmethod
-    def _handle_invoice_payment_succeeded(event: stripe.Event) -> bool:
+    def _handle_invoice_payment_succeeded(event: Any) -> bool:
         """Handle invoice.payment_succeeded event."""
         try:
             invoice = event.data.object
@@ -885,7 +923,7 @@ class StripeService:
             return False
     
     @staticmethod
-    def _handle_invoice_payment_failed(event: stripe.Event) -> bool:
+    def _handle_invoice_payment_failed(event: Any) -> bool:
         """Handle invoice.payment_failed event."""
         try:
             invoice = event.data.object

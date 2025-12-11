@@ -18,12 +18,52 @@ async def get_all_price_ids():
     """
     Get or create all Stripe price IDs for all plans.
     Returns the price IDs that should be used in the frontend.
+    If Stripe is not configured, returns placeholder price IDs with a warning flag.
     """
     if not stripe_price_manager.is_configured():
-        raise HTTPException(
-            status_code=503,
-            detail="Stripe is not configured. Please contact support."
-        )
+        logger.warning("Stripe is not configured. Returning placeholder price IDs.")
+        # Return placeholder price IDs so frontend doesn't break
+        # Frontend should check the stripe_available flag and show appropriate message
+        return {
+            "success": True,
+            "stripe_available": False,
+            "price_ids": {
+                "Starter": "",
+                "Pro": "",
+                "Enterprise": ""
+            },
+            "plans": {
+                "Starter": {
+                    "price_id": "",
+                    "name": "Starter Plan",
+                    "amount": 0,
+                    "currency": "usd"
+                },
+                "Pro": {
+                    "price_id": "",
+                    "name": "Pro Plan",
+                    "amount": 2900,
+                    "currency": "usd",
+                    "section": "premium",
+                    "metadata": {
+                        "plan_type": "pro",
+                        "tier": "professional"
+                    }
+                },
+                "Enterprise": {
+                    "price_id": "",
+                    "name": "Enterprise Plan",
+                    "amount": 9900,
+                    "currency": "usd",
+                    "section": "premium",
+                    "metadata": {
+                        "plan_type": "enterprise",
+                        "tier": "enterprise"
+                    }
+                }
+            },
+            "message": "Stripe is not configured. Please install stripe module and configure STRIPE_SECRET_KEY."
+        }
     
     try:
         # Ensure Pro and Enterprise have proper sections
@@ -36,6 +76,7 @@ async def get_all_price_ids():
         
         return {
             "success": True,
+            "stripe_available": True,
             "price_ids": price_ids,
             "plans": {
                 "Starter": {
@@ -109,4 +150,7 @@ async def ensure_plan_sections():
             status_code=500,
             detail=f"Failed to ensure plan sections: {str(e)}"
         )
+
+
+
 
