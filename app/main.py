@@ -3107,18 +3107,108 @@ async def get_diff(request: Request):
         if not file_id:
             return JSONResponse({"error": "fileId is required"}, status_code=400)
         
-        # Get file versions from file_versions
+        # Try to get file versions from file_versions manager first
+        from_text = None
+        to_text = None
+        
         try:
             from_version = file_version_manager.get_version(file_id, from_pass)
             to_version = file_version_manager.get_version(file_id, to_pass)
             
-            if not from_version or not to_version:
-                return JSONResponse({"error": f"Version {from_pass} or {to_pass} not found for file {file_id}"}, status_code=404)
-            
-            from_text = from_version.content
-            to_text = to_version.content
+            if from_version:
+                from_text = from_version.content
+            if to_version:
+                to_text = to_version.content
         except Exception as e:
-            return JSONResponse({"error": f"Could not retrieve file versions: {str(e)}"}, status_code=404)
+            logger.warning(f"Could not retrieve file versions from manager: {e}")
+        
+        # FALLBACK: If versions not found, search jobs_snapshot for pass_complete events
+        # Note: jobs_snapshot only stores the latest event per job_id, so we may only find one pass
+        if not from_text or not to_text:
+            from app.core.state import jobs_snapshot
+            logger.debug(f"Searching jobs_snapshot for file_id={file_id}, from_pass={from_pass}, to_pass={to_pass}")
+            
+            # Search through all jobs in snapshot
+            for job_id, job_data in jobs_snapshot.items():
+                if not isinstance(job_data, dict):
+                    continue
+                
+                # Check if this is a pass_complete event for our file_id
+                if (job_data.get('type') == 'pass_complete' and 
+                    job_data.get('fileId') == file_id):
+                    
+                    pass_num = job_data.get('pass')
+                    text_content = job_data.get('textContent')
+                    
+                    if pass_num == from_pass and text_content and not from_text:
+                        from_text = text_content
+                        logger.debug(f"Found from_pass {from_pass} content from jobs_snapshot for job {job_id}")
+                    
+                    if pass_num == to_pass and text_content and not to_text:
+                        to_text = text_content
+                        logger.debug(f"Found to_pass {to_pass} content from jobs_snapshot for job {job_id}")
+                    
+                    # If we found both, we can break early
+                    if from_text and to_text:
+                        break
+        
+        # FALLBACK 2: If still not found, try MongoDB job_events
+        # This is important for historical passes since jobs_snapshot only stores the latest event
+        if (not from_text or not to_text) and mongodb_db.is_connected():
+            try:
+                collection = mongodb_db._db.job_events if mongodb_db._db else None
+                jobs_collection = mongodb_db._db.jobs if mongodb_db._db else None
+                
+                if collection and jobs_collection:
+                    # First, find jobs that have this file_id
+                    matching_jobs = jobs_collection.find({"file_id": file_id}).sort("created_at", -1).limit(10)
+                    
+                    for job_doc in matching_jobs:
+                        job_id = job_doc.get("id")
+                        if not job_id:
+                            continue
+                        
+                        # Search for pass_complete events for this job with matching file_id and pass numbers
+                        events = collection.find({
+                            "job_id": job_id,
+                            "event_type": "pass_complete",
+                            "pass_number": {"$in": [from_pass, to_pass]},
+                            "details.fileId": file_id  # Ensure we match the correct file
+                        }).sort("created_at", -1)
+                        
+                        for event in events:
+                            pass_num = event.get("pass_number")
+                            details = event.get("details", {})
+                            # Check if details contain textContent
+                            text_content = details.get("textContent")
+                            
+                            if pass_num == from_pass and text_content and not from_text:
+                                from_text = text_content
+                                logger.debug(f"Found from_pass {from_pass} content from MongoDB for job {job_id}")
+                            
+                            if pass_num == to_pass and text_content and not to_text:
+                                to_text = text_content
+                                logger.debug(f"Found to_pass {to_pass} content from MongoDB for job {job_id}")
+                            
+                            if from_text and to_text:
+                                break
+                        
+                        if from_text and to_text:
+                            break
+            except Exception as e:
+                logger.warning(f"Could not retrieve from MongoDB: {e}")
+        
+        # If we still don't have both texts, return error
+        if not from_text or not to_text:
+            missing = []
+            if not from_text:
+                missing.append(f"pass {from_pass}")
+            if not to_text:
+                missing.append(f"pass {to_pass}")
+            return JSONResponse({
+                "error": f"Version {from_pass} or {to_pass} not found for file {file_id}",
+                "details": f"Missing: {', '.join(missing)}"
+            }, status_code=404)
         
         # Generate diff using difflib
         import difflib
