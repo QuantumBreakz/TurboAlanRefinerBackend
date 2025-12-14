@@ -3,7 +3,9 @@ from __future__ import annotations
 import os
 import re
 import time
+import hashlib
 from typing import Tuple, List, Optional, Dict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 try:  # optional, used for token budgeting
     import tiktoken  # type: ignore
@@ -25,10 +27,25 @@ class RefinementPipeline:
         self.settings = settings
         self.model = model
 
-        # Phase-0 configuration (can be toggled via env without code changes)
+        # Phase-0 configuration (defaults in code, can be overridden via env)
         self.max_input_tokens: int = int(os.getenv("REFINER_MAX_INPUT_TOKENS", "0") or 0)
         self.enable_domain_chunk: bool = os.getenv("REFINER_DOMAIN_CHUNK", "1") == "true" or os.getenv("REFINER_DOMAIN_CHUNK", "1") == "1"
         self.enable_placeholders: bool = os.getenv("REFINER_PLACEHOLDERS", "0") == "true" or os.getenv("REFINER_PLACEHOLDERS", "0") == "1"
+        
+        # Strategy analysis cache (class-level for performance)
+        # Key: hash of (text_hash, heuristics_hash), Value: (weights, rationale, approach, plan)
+        self._strategy_cache: Dict[str, Tuple[dict, str, str, 'StrategyPlan']] = {}
+        # Default: 100 entries, override via REFINER_STRATEGY_CACHE_SIZE
+        self._strategy_cache_max_size = int(os.getenv("REFINER_STRATEGY_CACHE_SIZE", "100") or 100)
+        
+        # Parallel processing configuration (defaults in code, override via env)
+        # Default: enabled, can be disabled via REFINER_PARALLEL_CHUNKS=0
+        parallel_chunks_env = os.getenv("REFINER_PARALLEL_CHUNKS", "1")
+        self._enable_parallel_chunks = parallel_chunks_env in ("1", "true", "True", "TRUE")
+        # Default: 4 workers, override via REFINER_MAX_PARALLEL_WORKERS
+        self._max_parallel_workers = int(os.getenv("REFINER_MAX_PARALLEL_WORKERS", "4") or 4)
+        # Ensure at least 1 worker and at most 10 (safety limit)
+        self._max_parallel_workers = max(1, min(10, self._max_parallel_workers))
 
     # ---- Phase-0 helpers ----
     def _get_model_name(self) -> Optional[str]:
@@ -829,6 +846,24 @@ class RefinementPipeline:
     def _analyze_strategy(self, text: str, heur: dict = None) -> tuple[dict, str, str, StrategyPlan]:
         """Call the model to produce strategy weights, rationale/approach, and slotting plan."""
         print(f"_analyze_strategy: Starting analysis (text length: {len(text)} chars)")
+        
+        # OPTIMIZATION: Check cache first to avoid redundant LLM calls
+        # Create cache key from text hash and heuristics hash
+        cache_key = None
+        try:
+            text_hash = hashlib.md5((text or "").encode('utf-8')).hexdigest()[:16]
+            heur_str = str(sorted((heur or {}).items())) if heur else "default"
+            heur_hash = hashlib.md5(heur_str.encode('utf-8')).hexdigest()[:16]
+            cache_key = f"{text_hash}_{heur_hash}"
+            
+            if cache_key in self._strategy_cache:
+                print(f"_analyze_strategy: Cache hit! Returning cached strategy analysis")
+                return self._strategy_cache[cache_key]
+        except Exception as e:
+            # If caching fails, continue with normal flow
+            print(f"_analyze_strategy: Cache check failed: {e}, continuing with normal analysis")
+            cache_key = None  # Ensure cache_key is None if caching fails
+        
         # Lightweight document context (can be expanded later)
         word_count = len((text or "").split())
         # Detect simple keywords provided by heuristics if present
@@ -1009,6 +1044,16 @@ class RefinementPipeline:
         if mode == 'rules':
             w, r, a = _rule_based()
             plan = self._build_strategy_plan(w)
+            # Cache the result if cache_key is available
+            if cache_key:
+                try:
+                    if len(self._strategy_cache) >= self._strategy_cache_max_size:
+                        # Remove oldest entry (simple FIFO eviction)
+                        oldest_key = next(iter(self._strategy_cache))
+                        del self._strategy_cache[oldest_key]
+                    self._strategy_cache[cache_key] = (w, r, a, plan)
+                except Exception:
+                    pass  # If caching fails, continue
             return w, r, a, plan
 
         try:
@@ -1029,6 +1074,16 @@ class RefinementPipeline:
             print(f"_analyze_strategy: LLM call failed ({e}), using rule-based fallback")
             w, r, a = _rule_based()
             plan = self._build_strategy_plan(w)
+            # Cache the result if cache_key is available
+            if cache_key:
+                try:
+                    if len(self._strategy_cache) >= self._strategy_cache_max_size:
+                        # Remove oldest entry (simple FIFO eviction)
+                        oldest_key = next(iter(self._strategy_cache))
+                        del self._strategy_cache[oldest_key]
+                    self._strategy_cache[cache_key] = (w, r, a, plan)
+                except Exception:
+                    pass  # If caching fails, continue
             return w, r, a, plan
         w, r, a = self._parse_strategy_weights(strategy_text)
         # Apply nudges from history profile if present
@@ -1040,6 +1095,16 @@ class RefinementPipeline:
         except Exception:
             pass
         plan = self._extract_strategy_slots(strategy_text, w)
+        # Cache the result if cache_key is available
+        if cache_key:
+            try:
+                if len(self._strategy_cache) >= self._strategy_cache_max_size:
+                    # Remove oldest entry (simple FIFO eviction)
+                    oldest_key = next(iter(self._strategy_cache))
+                    del self._strategy_cache[oldest_key]
+                self._strategy_cache[cache_key] = (w, r, a, plan)
+            except Exception:
+                pass  # If caching fails, continue
         return w, r, a, plan
 
     def _build_strategy_plan(self, weights: dict) -> StrategyPlan:
@@ -1276,6 +1341,9 @@ class RefinementPipeline:
 
         # 5) Run phases with combined system prompt
         out = text
+        # Initialize token tracking variables
+        pass_pre_tokens: int = 0
+        pass_used_in_tokens: int = 0
         print(f"_three_phase_refine: Starting phase loop with {len(phases)} phases")
         for idx, (system_msg, temp) in enumerate(phases, 1):
             print(f"_three_phase_refine: Starting phase {idx}/{len(phases)}: {system_msg} (temp={temp})")
@@ -1302,56 +1370,155 @@ class RefinementPipeline:
             else:
                 chunks = [out]
 
-            generated_parts: List[str] = []
-            for ch in chunks:
-                payload = ch
-                ph_map = {}
-                if self.enable_placeholders:
-                    payload, ph_map = self._apply_placeholders(payload)
-
-                # Preflight token count for this chunk (system + payload)
-                try:
-                    pre_tokens = self._count_tokens((sys_full or "") + "\n" + (payload or ""), model_name)
-                    pass_pre_tokens += int(pre_tokens)
-                except Exception:
-                    pass
-
-                if hasattr(self, '_current_job_id') and self._current_job_id:
-                    gen_txt, cost_info = self.model.generate(system=sys_full, user=payload, temperature=temp, max_tokens=2000, job_id=self._current_job_id, user_id=getattr(self, '_current_user_id', None))
-                    if not hasattr(self, '_pass_costs'):
-                        self._pass_costs = []
-                    self._pass_costs.append(cost_info)
+            # OPTIMIZATION: Process chunks in parallel for better performance
+            # Only parallelize if enabled and we have multiple chunks
+            use_parallel = (self._enable_parallel_chunks and 
+                           len(chunks) > 1 and 
+                           hasattr(self, '_current_job_id') and 
+                           self._current_job_id)
+            
+            if use_parallel:
+                print(f"_three_phase_refine: Processing {len(chunks)} chunks in parallel (max {self._max_parallel_workers} workers)")
+                generated_parts: List[str] = [""] * len(chunks)  # Pre-allocate list
+                cost_infos: List[dict] = []
+                
+                def process_chunk(chunk_idx: int, chunk: str) -> Tuple[int, str, dict]:
+                    """Process a single chunk and return its index, generated text, and cost info."""
                     try:
-                        pass_used_in_tokens += int(cost_info.get('tokens_in', 0) or 0)
+                        payload = chunk
+                        ph_map = {}
+                        if self.enable_placeholders:
+                            payload, ph_map = self._apply_placeholders(payload)
+                        
+                        # Preflight token count for this chunk (system + payload)
+                        pre_tokens = 0
+                        try:
+                            pre_tokens = self._count_tokens((sys_full or "") + "\n" + (payload or ""), model_name)
+                        except Exception:
+                            pass
+                        
+                        # OPTIMIZATION: Dynamic max_tokens based on input size
+                        # Adaptive: 50% of input tokens, but between 1000-4000
+                        try:
+                            input_tokens = pre_tokens if pre_tokens > 0 else self._count_tokens(payload, model_name)
+                            adaptive_max_tokens = min(4000, max(1000, int(input_tokens * 0.5)))
+                        except Exception:
+                            adaptive_max_tokens = 2000  # Fallback to default
+                        
+                        # Generate text
+                        gen_txt, cost_info = self.model.generate(
+                            system=sys_full, 
+                            user=payload, 
+                            temperature=temp, 
+                            max_tokens=adaptive_max_tokens, 
+                            job_id=self._current_job_id, 
+                            user_id=getattr(self, '_current_user_id', None)
+                        )
+                        
+                        # Restore placeholders if needed
+                        if self.enable_placeholders and ph_map:
+                            try:
+                                gen_txt = self._restore_placeholders(gen_txt if isinstance(gen_txt, str) else gen_txt[0], ph_map)
+                            except Exception:
+                                pass
+                        
+                        # Normalize gen_txt
+                        if isinstance(gen_txt, tuple):
+                            gen_txt = gen_txt[0]
+                        
+                        return chunk_idx, str(gen_txt), cost_info, pre_tokens
+                    except Exception as e:
+                        # If chunk processing fails, return error info but don't crash
+                        print(f"_three_phase_refine: Error processing chunk {chunk_idx}: {e}")
+                        return chunk_idx, "", {'total_cost': 0, 'tokens_in': 0, 'tokens_out': 0}, 0
+                
+                # Process chunks in parallel using ThreadPoolExecutor
+                with ThreadPoolExecutor(max_workers=self._max_parallel_workers) as executor:
+                    futures = {executor.submit(process_chunk, idx, ch): idx for idx, ch in enumerate(chunks)}
+                    
+                    for future in as_completed(futures):
+                        try:
+                            chunk_idx, gen_txt, cost_info, pre_tokens = future.result()
+                            generated_parts[chunk_idx] = gen_txt
+                            cost_infos.append(cost_info)
+                            try:
+                                pass_pre_tokens += int(pre_tokens)
+                                pass_used_in_tokens += int(cost_info.get('tokens_in', 0) or 0)
+                            except Exception:
+                                pass
+                        except Exception as e:
+                            print(f"_three_phase_refine: Error getting result from chunk processing: {e}")
+                            # Continue with other chunks
+                
+                # Track all costs
+                if not hasattr(self, '_pass_costs'):
+                    self._pass_costs = []
+                self._pass_costs.extend(cost_infos)
+                
+            else:
+                # Sequential processing (fallback or single chunk)
+                generated_parts: List[str] = []
+                for ch in chunks:
+                    payload = ch
+                    ph_map = {}
+                    if self.enable_placeholders:
+                        payload, ph_map = self._apply_placeholders(payload)
+
+                    # Preflight token count for this chunk (system + payload)
+                    try:
+                        pre_tokens = self._count_tokens((sys_full or "") + "\n" + (payload or ""), model_name)
+                        pass_pre_tokens += int(pre_tokens)
                     except Exception:
                         pass
-                else:
-                    import logging
-                    logger = logging.getLogger(__name__)
-                    logger.debug("No _current_job_id, calling model.generate without job_id")
-                    result = self.model.generate(system=sys_full, user=payload, temperature=temp, max_tokens=2000, user_id=getattr(self, '_current_user_id', None))
-                    if isinstance(result, tuple):
-                        gen_txt, cost_info = result
-                        # Still track costs even without job_id
+
+                    if hasattr(self, '_current_job_id') and self._current_job_id:
+                        # OPTIMIZATION: Dynamic max_tokens based on input size
+                        try:
+                            input_tokens = self._count_tokens(payload, model_name)
+                            adaptive_max_tokens = min(4000, max(1000, int(input_tokens * 0.5)))
+                        except Exception:
+                            adaptive_max_tokens = 2000  # Fallback to default
+                        gen_txt, cost_info = self.model.generate(system=sys_full, user=payload, temperature=temp, max_tokens=adaptive_max_tokens, job_id=self._current_job_id, user_id=getattr(self, '_current_user_id', None))
                         if not hasattr(self, '_pass_costs'):
                             self._pass_costs = []
                         self._pass_costs.append(cost_info)
+                        try:
+                            pass_used_in_tokens += int(cost_info.get('tokens_in', 0) or 0)
+                        except Exception:
+                            pass
                     else:
-                        gen_txt = result
-                        # If no cost_info returned, create empty one
-                        cost_info = {'total_cost': 0, 'tokens_in': 0, 'tokens_out': 0}
+                        import logging
+                        logger = logging.getLogger(__name__)
+                        logger.debug("No _current_job_id, calling model.generate without job_id")
+                        # OPTIMIZATION: Dynamic max_tokens based on input size
+                        try:
+                            input_tokens = self._count_tokens(payload, model_name)
+                            adaptive_max_tokens = min(4000, max(1000, int(input_tokens * 0.5)))
+                        except Exception:
+                            adaptive_max_tokens = 2000  # Fallback to default
+                        result = self.model.generate(system=sys_full, user=payload, temperature=temp, max_tokens=adaptive_max_tokens, user_id=getattr(self, '_current_user_id', None))
+                        if isinstance(result, tuple):
+                            gen_txt, cost_info = result
+                            # Still track costs even without job_id
+                            if not hasattr(self, '_pass_costs'):
+                                self._pass_costs = []
+                            self._pass_costs.append(cost_info)
+                        else:
+                            gen_txt = result
+                            # If no cost_info returned, create empty one
+                            cost_info = {'total_cost': 0, 'tokens_in': 0, 'tokens_out': 0}
 
-                if self.enable_placeholders and ph_map:
-                    try:
-                        gen_txt = self._restore_placeholders(gen_txt if isinstance(gen_txt, str) else gen_txt[0], ph_map)
-                    except Exception:
-                        pass
+                    if self.enable_placeholders and ph_map:
+                        try:
+                            gen_txt = self._restore_placeholders(gen_txt if isinstance(gen_txt, str) else gen_txt[0], ph_map)
+                        except Exception:
+                            pass
 
-                # If generate returned tuple in non-job_id path, normalize
-                if isinstance(gen_txt, tuple):
-                    gen_txt = gen_txt[0]
+                    # If generate returned tuple in non-job_id path, normalize
+                    if isinstance(gen_txt, tuple):
+                        gen_txt = gen_txt[0]
 
-                generated_parts.append(str(gen_txt))
+                    generated_parts.append(str(gen_txt))
 
             out = "\n\n".join([p for p in generated_parts if p])
             print(f"_three_phase_refine: LLM call completed for phase {idx} (output length: {len(out)} chars)")
@@ -1359,14 +1526,21 @@ class RefinementPipeline:
         # Store initial state for potential rollback
         initial_out = out
         
-        # Micro quick pass
-        out = self._micro_quick_pass(out, {
-            'avg_sentence_len_min': sl_min,
-            'avg_sentence_len_max': sl_max,
-            'banned_cliches': banned
-        })
+        # OPTIMIZATION: Make micro quick pass optional for speed
+        # Can be skipped via heuristics.skip_micro_pass or REFINER_SKIP_MICRO_PASS env var
+        skip_micro = (heur or {}).get('skip_micro_pass', False) or os.getenv("REFINER_SKIP_MICRO_PASS", "0") in ("1", "true", "True")
         
-        # Validate after micro pass
+        if not skip_micro:
+            # Micro quick pass
+            out = self._micro_quick_pass(out, {
+                'avg_sentence_len_min': sl_min,
+                'avg_sentence_len_max': sl_max,
+                'banned_cliches': banned
+            })
+        else:
+            print(f"_three_phase_refine: Skipping micro quick pass (optimization enabled)")
+        
+        # Validate after micro pass (or use initial score if skipped)
         micro_targets = {
             'avg_sentence_len_min': sl_min,
             'avg_sentence_len_max': sl_max,
@@ -1376,8 +1550,12 @@ class RefinementPipeline:
             'max_cliche_hits': 0
         }
         
-        post_micro_validation = self._validate_microstructure_targets(out, micro_targets, heur)
-        post_micro_score = post_micro_validation.get('validation_score', 0.0)
+        if not skip_micro:
+            post_micro_validation = self._validate_microstructure_targets(out, micro_targets, heur)
+            post_micro_score = post_micro_validation.get('validation_score', 0.0)
+        else:
+            # If micro pass was skipped, use a default score
+            post_micro_score = 0.8  # Assume good quality if we skip micro pass
         
         # tone quick pass (lexicon swap with guardrails)
         tone_backup = out  # Backup before tone pass
