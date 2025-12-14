@@ -362,7 +362,7 @@ async def _process_refinement_pass(
     job_id: str,
     output_sink
 ) -> tuple:
-    """Process a single refinement pass and return (success, final_text, metrics)"""
+    """Process a single refinement pass and return (success, final_text, metrics, pipeline_state, result)"""
     try:
         logger.debug(f"Starting pass {pass_num} of {request.passes}")
         
@@ -540,7 +540,7 @@ async def _process_refinement_pass(
         except Exception:
             pass
         
-        return True, ft, metrics
+        return True, ft, metrics, ps, rr
         
     except Exception as e:
         error_msg = str(e).replace('"', '\\"').replace('\n', '\\n').replace('\r', '\\r')
@@ -555,7 +555,7 @@ async def _process_refinement_pass(
         except Exception:
             pass
         logger.error(f"Pass {pass_num} failed: {e}")
-        return False, current_text, {}
+        return False, current_text, {}, None, None
 
 async def _refine_stream(request: RefinementRequest, job_id: str) -> AsyncGenerator[str, None]:
     logger.debug(f"Starting refinement stream for job {job_id}")
@@ -716,31 +716,6 @@ async def _refine_stream(request: RefinementRequest, job_id: str) -> AsyncGenera
                     except Exception:
                         pass
                     yield f"{safe_encoder(running_evt)}\n\n"
-                    logger.debug(f"About to call pipeline.run_pass for pass {pass_num}")
-                    
-                    try:
-                        # Run blocking pipeline call in executor to avoid blocking event loop
-                        loop = asyncio.get_event_loop()
-                        ps, rr, ft = await loop.run_in_executor(
-                            None,  # Use default ThreadPoolExecutor
-                            lambda: pipeline.run_pass(
-                                input_path=file_path,
-                                pass_index=pass_num,
-                                prev_final_text=current_text,  # Use current text as input for next pass
-                                entropy_level=request.entropy_level,
-                                output_sink=output_sink,
-                                drive_title_base=Path(file_path).stem,
-                                heuristics_overrides=request.heuristics,
-                                job_id=job_id,
-                                user_id=request.user_id if hasattr(request, 'user_id') else None
-                            )
-                        )
-                        logger.debug(f"pipeline.run_pass completed for pass {pass_num}")
-                    except Exception as e:
-                        logger.error(f"pipeline.run_pass failed for pass {pass_num}: {e}")
-                        import traceback
-                        traceback.print_exc()
-                        raise
                     
                     # Log pass start to MongoDB
                     if mongodb_db.is_connected():
@@ -751,8 +726,9 @@ async def _refine_stream(request: RefinementRequest, job_id: str) -> AsyncGenera
                             pass_number=pass_num
                         )
                     
-                    # Process the pass
-                    success, refined_text, metrics = await _process_refinement_pass(
+                    # Process the pass (this internally calls pipeline.run_pass)
+                    # CRITICAL FIX: Removed duplicate run_pass call - _process_refinement_pass already calls it
+                    success, refined_text, metrics, ps, rr = await _process_refinement_pass(
                         pipeline, 
                         file_path, 
                         current_text, 
@@ -762,6 +738,23 @@ async def _refine_stream(request: RefinementRequest, job_id: str) -> AsyncGenera
                         job_id,
                         output_sink
                     )
+                    
+                    # Get the final text from refined_text
+                    ft = refined_text
+                    
+                    # If pipeline state is None (error case), skip stage updates
+                    if ps is None:
+                        logger.error(f"Pipeline state is None for pass {pass_num}, skipping stage updates")
+                        # Don't break - continue to next pass or emit error
+                        error_evt = {'type': 'error', 'jobId': job_id, 'fileId': file_id, 'fileName': file_name, 'pass': pass_num, 'error': 'Pipeline state is None - pass may have failed'}
+                        try:
+                            await ws_manager.broadcast(job_id, error_evt)  # type: ignore
+                        except Exception:
+                            pass
+                        jobs_snapshot[job_id] = error_evt
+                        yield f"{safe_encoder(error_evt)}\n\n"
+                        # Continue to next pass instead of breaking
+                        continue
 
                     # Log pass completion to MongoDB
                     if mongodb_db.is_connected():
@@ -804,7 +797,7 @@ async def _refine_stream(request: RefinementRequest, job_id: str) -> AsyncGenera
                     # Validate that the pass actually produced meaningful changes to prevent infinite recursion
                     if pass_num > 1:
                         # Check for exact duplicates
-                        if ft == current_text:
+                        if refined_text == current_text:
                             logger.warning(f"Pass {pass_num} produced identical text, stopping to prevent infinite recursion")
                             warning_msg = {'type': 'warning', 'jobId': job_id, 'fileId': file_id, 'fileName': file_name, 'pass': pass_num, 'message': 'Pass produced identical text, stopping refinement'}
                             try:
@@ -923,7 +916,12 @@ async def _refine_stream(request: RefinementRequest, job_id: str) -> AsyncGenera
                         pass
                     jobs_snapshot[job_id] = pc_evt
                     try:
-                        prog = min(100.0, (pass_num / max(1, request.passes)) * 100.0)
+                        # CRITICAL FIX: Calculate progress correctly accounting for start_pass
+                        # pass_num is the actual pass number, start_pass is where we started
+                        # current_pass_index is 1-indexed within the current batch
+                        current_pass_index = pass_num - start_pass + 1
+                        total_passes = request.passes
+                        prog = min(100.0, (current_pass_index / max(1, total_passes)) * 100.0)
                         upsert_job(job_id, {"current_stage": "pass_complete", "progress": prog, "status": "running"})
                     except Exception:
                         pass
@@ -948,6 +946,25 @@ async def _refine_stream(request: RefinementRequest, job_id: str) -> AsyncGenera
                         pass
                     yield f"{safe_encoder(err2)}\n\n"
                     log_exception("REFINEMENT_STREAM_ERROR", e)
+            
+            # CRITICAL FIX: After pass loop completes, emit file completion event
+            # This ensures the frontend knows the file processing is done
+            if file_processed_successfully:
+                logger.debug(f"All passes completed for file {file_id}, emitting file completion")
+                file_complete_evt = {
+                    'type': 'file_complete',
+                    'jobId': job_id,
+                    'fileId': file_id,
+                    'fileName': file_name,
+                    'finalPass': end_pass - 1,  # Last pass number
+                    'message': f'All {request.passes} passes completed for {file_name}'
+                }
+                try:
+                    await ws_manager.broadcast(job_id, file_complete_evt)  # type: ignore
+                except Exception:
+                    pass
+                jobs_snapshot[job_id] = file_complete_evt
+                yield f"{safe_encoder(file_complete_evt)}\n\n"
             
             # Increment counter for successfully processed file (only once per file)
             if file_processed_successfully:
@@ -1047,9 +1064,26 @@ async def refine_run(request: RefinementRequest):
         logger.error(f"REFINE_RUN: Pipeline error: {e}")
         return JSONResponse({"error": f"Pipeline initialization failed: {str(e)}"}, status_code=500)
     job_id = str(uuid.uuid4())
+    # CRITICAL FIX: Store job in MongoDB for persistence across serverless invocations
     try:
+        if mongodb_db.is_connected():
+            # Get file info for job creation
+            file_name = request.files[0].get("name", "Unknown") if request.files else "Unknown"
+            file_id = request.files[0].get("id", "unknown") if request.files else "unknown"
+            user_id = getattr(request, 'user_id', None) or "default"
+            mongodb_db.create_job(
+                job_id=job_id,
+                file_name=file_name,
+                file_id=file_id,
+                user_id=user_id,
+                total_passes=request.passes,
+                model=getattr(request, 'model', 'gpt-4'),
+                metadata={"entropy_level": request.entropy_level, "aggressiveness": request.aggressiveness}
+            )
+        # Also store in in-memory for backward compatibility
         upsert_job(job_id, {"status": "running", "progress": 0.0, "current_stage": "initializing"})
-    except Exception:
+    except Exception as e:
+        logger.warning(f"Failed to create job in storage: {e}")
         pass
     async def event_gen():
         # Small preamble to nudge immediate flush on some clients/proxies
