@@ -611,6 +611,28 @@ class MongoDB:
             _safe_log(f"Failed to log event for job {job_id}: {e}")
             return False
 
+    def get_job_by_id(self, job_id: str) -> Optional[Dict]:
+        """Get a single job by ID."""
+        if self._db is None:
+            return None
+        try:
+            collection = self._db.jobs
+            result = collection.find_one({"id": job_id})
+            
+            if result:
+                # Convert ObjectId to string and format dates
+                if "_id" in result:
+                    result["_id"] = str(result["_id"])
+                if "created_at" in result:
+                    result["created_at"] = result["created_at"].isoformat()
+                if "updated_at" in result:
+                    result["updated_at"] = result["updated_at"].isoformat()
+                return result
+            return None
+        except Exception as e:
+            _safe_log(f"Failed to get job {job_id}: {e}")
+            return None
+
     def get_jobs(self, limit: int = 100, user_id: Optional[str] = None) -> List[Dict]:
         """Get list of jobs."""
         if self._db is None:
