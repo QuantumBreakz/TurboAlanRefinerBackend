@@ -862,7 +862,7 @@ class RefinementPipeline:
             hist_cfg = (heur.get('history_analysis') or {}) if isinstance(heur, dict) else {}
             if hist_cfg is True or (isinstance(hist_cfg, dict) and hist_cfg.get('enabled', True)):
                 # Use centralized path configuration
-                from core.paths import get_data_dir
+                from app.core.paths import get_data_dir
                 default_history = str(get_data_dir() / 'recent_history.json')
                 history_path = hist_cfg.get('history_path', default_history)
                 
