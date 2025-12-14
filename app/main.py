@@ -930,12 +930,19 @@ async def health_fast() -> Dict[str, Any]:
 @app.get("/jobs/{job_id}/status")
 async def job_status(job_id: str) -> Dict[str, Any]:
     """Return the latest progress snapshot for a jobId (polling fallback with DB)."""
-    from core.database import asdict
+    from app.core.database import asdict, get_job
+    # First check MongoDB (persistent storage)
+    if mongodb_db.is_connected():
+        mongo_job = mongodb_db.get_job_by_id(job_id)
+        if mongo_job:
+            return {"jobId": job_id, **mongo_job}
+    # Then check in-memory database
     row = get_job(job_id)
     if row:
         # Convert RefinementJob dataclass to dict
         job_dict = asdict(row)
         return {"jobId": job_id, **job_dict}
+    # Finally check snapshot
     snap = jobs_snapshot.get(job_id)
     return snap or {"jobId": job_id, "status": "unknown"}
 
@@ -1210,7 +1217,7 @@ async def serve_file_by_name(filename: str):
     Serve a file from the output directory by filename.
     This endpoint is used by the frontend to download processed files.
     """
-    from core.paths import get_output_dir
+    from app.core.paths import get_output_dir
     
     if not filename:
         raise APIError("Filename is required", 400, "MISSING_FILENAME")
