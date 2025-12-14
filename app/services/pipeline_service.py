@@ -216,10 +216,17 @@ class RefinementPipeline:
 
         result = RunResult(file_path=input_path, pass_index=pass_index, success=False)
 
-        # Read
+        # Read - CRITICAL FIX: Use previous pass output if available, otherwise read from file
         print(f"PIPELINE: Starting READ stage for pass {pass_index}")
         t0 = time.perf_counter()
-        raw = read_text_from_file(input_path)
+        if prev_final_text and pass_index > 1:
+            # Use previous pass output for cumulative refinement
+            raw = prev_final_text
+            print(f"PIPELINE: Using previous pass output ({len(raw)} chars) as input for pass {pass_index}")
+        else:
+            # First pass: read from original file
+            raw = read_text_from_file(input_path)
+            print(f"PIPELINE: Reading from file ({len(raw)} chars) for pass {pass_index}")
         ps.stages["read"].status = "ok"
         ps.stages["read"].duration_ms = (time.perf_counter() - t0) * 1000.0
         print(f"PIPELINE: READ stage completed ({ps.stages['read'].duration_ms:.2f}ms), read {len(raw)} chars")
@@ -307,6 +314,24 @@ class RefinementPipeline:
 
         # Post
         t0 = time.perf_counter()
+        # CRITICAL FIX: Increase humanization intensity progressively with each pass
+        # This ensures cumulative refinement and more human-like text
+        if isinstance(heur, dict):
+            huma_cfg = heur.get('humanize_academic', {})
+            if isinstance(huma_cfg, dict) and huma_cfg.get('enabled', False):
+                # Progressively increase intensity: light -> medium -> strong
+                base_intensity = huma_cfg.get('intensity', 'light')
+                if pass_index == 1:
+                    progressive_intensity = 'light'
+                elif pass_index == 2:
+                    progressive_intensity = 'medium'
+                else:
+                    progressive_intensity = 'strong'
+                # Override intensity for this pass
+                heur = dict(heur)  # Make a copy to avoid mutating original
+                heur['humanize_academic'] = dict(huma_cfg)
+                heur['humanize_academic']['intensity'] = progressive_intensity
+                print(f"PIPELINE: Pass {pass_index} using progressive intensity: {progressive_intensity} (base: {base_intensity})")
         final = post_pass_adjustments(refined, heur)
         
         # Apply macro analysis recommendations if available
