@@ -1065,13 +1065,23 @@ async def refine_run(request: RefinementRequest):
         return JSONResponse({"error": f"Pipeline initialization failed: {str(e)}"}, status_code=500)
     job_id = str(uuid.uuid4())
     # CRITICAL FIX: Store job in MongoDB for persistence across serverless invocations
+    # Also immediately store in snapshot for immediate availability
+    initial_job_state = {
+        "type": "job",
+        "jobId": job_id,
+        "status": "running",
+        "progress": 0.0,
+        "current_stage": "initializing"
+    }
+    safe_jobs_snapshot_set(job_id, initial_job_state)
+    
     try:
         if mongodb_db.is_connected():
             # Get file info for job creation
             file_name = request.files[0].get("name", "Unknown") if request.files else "Unknown"
             file_id = request.files[0].get("id", "unknown") if request.files else "unknown"
             user_id = getattr(request, 'user_id', None) or "default"
-            mongodb_db.create_job(
+            success = mongodb_db.create_job(
                 job_id=job_id,
                 file_name=file_name,
                 file_id=file_id,
@@ -1080,10 +1090,13 @@ async def refine_run(request: RefinementRequest):
                 model=getattr(request, 'model', 'gpt-4'),
                 metadata={"entropy_level": request.entropy_level, "aggressiveness": request.aggressiveness}
             )
+            if not success:
+                logger.warning(f"Failed to create job {job_id} in MongoDB")
         # Also store in in-memory for backward compatibility
         upsert_job(job_id, {"status": "running", "progress": 0.0, "current_stage": "initializing"})
     except Exception as e:
         logger.warning(f"Failed to create job in storage: {e}")
+        # Don't fail - snapshot is already set, so job status will work
         pass
     async def event_gen():
         # Small preamble to nudge immediate flush on some clients/proxies
