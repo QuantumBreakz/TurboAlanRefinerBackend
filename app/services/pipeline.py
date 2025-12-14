@@ -476,7 +476,10 @@ def _humanize_academic(
     import re as _re
     if not text:
         return text
-    low_intensity = {'light': 0.3, 'medium': 0.6, 'strong': 0.9}.get((intensity or 'light').lower(), 0.3)
+    # CRITICAL FIX: Increase base intensity values for more aggressive humanization
+    # Original: light=0.3, medium=0.6, strong=0.9
+    # New: light=0.5, medium=0.75, strong=0.95 (more aggressive transformation)
+    low_intensity = {'light': 0.5, 'medium': 0.75, 'strong': 0.95}.get((intensity or 'light').lower(), 0.5)
     keywords = [str(k).strip().lower() for k in (keywords or []) if str(k).strip()]
 
     # Use the module-level _sentences function for consistent abbreviation handling
