@@ -210,6 +210,47 @@ class RefinementPipeline:
         except Exception:
             base_heur = dict(self.settings.heuristics or {}) if isinstance(self.settings.heuristics, dict) else {}
         heur = _deep_merge(base_heur, heuristics_overrides or {})
+
+        # Style presets (optional): conversational, journalistic, academic-lite
+        def _apply_style_preset(h: dict, preset: str) -> dict:
+            if not preset or not isinstance(h, dict):
+                return h
+            p = preset.lower().strip()
+            h = dict(h)
+            ha = dict(h.get('humanize_academic') or {})
+            ha.setdefault('enabled', True)
+            # Default paragraph settings
+            h.setdefault('post_paragraph_restorer', True)
+            h.setdefault('post_sentences_per_paragraph', 6)
+            if p == 'conversational':
+                ha['intensity'] = ha.get('intensity', 'medium')
+                h['post_sentences_per_paragraph'] = 5
+                # Slightly higher entropy for variety
+                ent = dict(h.get('entropy') or {})
+                ent.setdefault('risk_preference', 0.6)
+                h['entropy'] = ent
+            elif p == 'journalistic':
+                ha['intensity'] = ha.get('intensity', 'medium')
+                h['post_sentences_per_paragraph'] = 4
+                ent = dict(h.get('entropy') or {})
+                ent.setdefault('risk_preference', 0.55)
+                h['entropy'] = ent
+            elif p in ('academic-lite', 'academic_lite', 'academic'):
+                ha['intensity'] = ha.get('intensity', 'strong')
+                h['post_sentences_per_paragraph'] = 6
+                ent = dict(h.get('entropy') or {})
+                ent.setdefault('risk_preference', 0.45)
+                h['entropy'] = ent
+            h['humanize_academic'] = ha
+            h['style_preset'] = p
+            return h
+
+        preset = None
+        try:
+            preset = (heuristics_overrides or {}).get('style_preset') or heur.get('style_preset')
+        except Exception:
+            preset = None
+        heur = _apply_style_preset(heur, preset)
         ps = PassState(index=pass_index)
         for name in ["read","prep","refine","post","write","upload"]:
             ps.stages[name] = StageState(name=name)
@@ -362,7 +403,31 @@ class RefinementPipeline:
                 heur['humanize_academic'] = dict(huma_cfg)
                 heur['humanize_academic']['intensity'] = progressive_intensity
                 print(f"PIPELINE: Pass {pass_index} using progressive intensity: {progressive_intensity} (base: {base_intensity})")
+            # Paragraph reflow for later passes to improve pacing
+            if pass_index >= 2:
+                heur = dict(heur)
+                heur.setdefault('post_paragraph_restorer', True)
+                heur.setdefault('post_sentences_per_paragraph', 6)
+            # Guardrails: length/readability rollback if badly out of range
+            pre_guard_text = refined
         final = post_pass_adjustments(refined, heur)
+        # Guardrails after post adjustments
+        try:
+            metrics = self._micro_metrics(final)
+            asl = metrics.get('avg_sentence_len', 0)
+            passive_rate = metrics.get('passive_rate', 0)
+            hedge_density = metrics.get('hedge_density', 0)
+            # Length ratio check vs refined input
+            try:
+                ratio = (len(final) / max(1, len(refined)))
+            except Exception:
+                ratio = 1.0
+            # If badly out of range, roll back to pre-guard text
+            if not (0.85 <= ratio <= 1.15) or not (12 <= asl <= 24) or passive_rate > 0.35 or hedge_density > 0.20:
+                print(f"PIPELINE: Rolling back post adjustments due to guardrails (ratio={ratio:.2f}, asl={asl:.1f}, passive={passive_rate:.2f}, hedge={hedge_density:.2f})")
+                final = pre_guard_text
+        except Exception:
+            pass
         
         # Apply macro analysis recommendations if available
         try:
@@ -777,6 +842,46 @@ class RefinementPipeline:
             t = _strategy_insight_det(t)
         except Exception:
             pass
+        # De-duplicate overused transitions (keep at most 1–2; favor 1)
+        transitions = ["however,", "moreover,", "additionally,", "therefore,", "furthermore,"]
+        for trans in transitions:
+            pattern = rf"(?i)\b{_re.escape(trans)}"
+            matches = list(_re.finditer(pattern, t))
+            cap = 1  # tighten to 1 per document chunk
+            if len(matches) > cap:
+                # Keep first 'cap', remove the rest
+                keep = set(idx for idx, _m in enumerate(matches[:cap]))
+                new_parts = []
+                last_end = 0
+                for idx, m in enumerate(matches):
+                    if idx in keep:
+                        new_parts.append(t[last_end:m.start()])
+                        new_parts.append(m.group(0))
+                    else:
+                        new_parts.append(t[last_end:m.start()])
+                    last_end = m.end()
+                new_parts.append(t[last_end:])
+                t = "".join(new_parts)
+        # Sentence-start balancer: vary repeated starters
+        sents = [s for s in _re.split(r"(?<=[.!?])\s+", t.strip()) if s]
+        varied = []
+        recent_starts = []
+        start_variations = [
+            "Often", "In many cases", "From there", "Generally", "Usually",
+            "Sometimes", "At times", "In practice"
+        ]
+        for i, s in enumerate(sents):
+            words = s.split()
+            first = (words[:1] or [""])[0].lower()
+            if first in ["the","this","it","there","these","those"] and len(words) > 6:
+                if recent_starts.count(first) >= 1:  # if repeated recently
+                    alt = start_variations[i % len(start_variations)]
+                    s = _re.sub(r"^[A-Za-z]+", alt, s, count=1)
+            recent_starts.append(first)
+            if len(recent_starts) > 4:
+                recent_starts.pop(0)
+            varied.append(s)
+        t = " ".join(varied)
         # Trim extra spaces
         t = _re.sub(r"\s+\n", "\n", t)
         t = _re.sub(r"\n\s+", "\n", t)
@@ -878,6 +983,13 @@ class RefinementPipeline:
             'commence': 'start', 'initiate': 'start',
             'terminate': 'end', 'finalize': 'finish',
             'approximately': 'about', 'around': 'about',
+            'overall': 'in total', 'consequently': 'so', 'therefore': 'so',
+            'furthermore': 'also', 'moreover': 'also', 'additionally': 'also',
+            'in addition': 'also', 'nevertheless': 'still', 'nonetheless': 'still',
+            'utilization': 'use', 'implementation': 'use', 'methodology': 'method',
+            'assistance': 'help', 'assess': 'check', 'evaluate': 'check',
+            'significantly': 'a lot', 'substantially': 'a lot',
+            'prior to': 'before', 'subsequent to': 'after',
         }
         
         if pass_index >= 2:
@@ -932,6 +1044,57 @@ class RefinementPipeline:
                     filler = natural_fillers[i % len(natural_fillers)]
                     if sent and len(sent) > 0:
                         sent = filler + " " + sent[0].lower() + sent[1:]
+                varied.append(sent)
+            text = " ".join(varied)
+
+        # 4. Light contraction & idiom injection (pass >= 2, very low rate)
+        if pass_index >= 2:
+            # Contractions (light): apply to a small subset to avoid overuse
+            contractions_extra = {
+                r"\bthere is\b": "there's",
+                r"\bthere are\b": "there're",
+                r"\bit is\b": "it's",
+                r"\bit has\b": "it's",
+                r"\bit will\b": "it'll",
+                r"\byou are\b": "you're",
+                r"\byou have\b": "you've",
+                r"\bthey are\b": "they're",
+                r"\bthey have\b": "they've",
+                r"\bwe are\b": "we're",
+                r"\bwe have\b": "we've",
+            }
+            # Apply ~15-25% based on pass
+            for pattern, replacement in contractions_extra.items():
+                matches = _re.findall(pattern, text, flags=_re.IGNORECASE)
+                if not matches:
+                    continue
+                replacement_prob = 0.15 + 0.1 * min((pass_index - 1) / 3, 1.0)
+                def replace_some(m, rp=replacement_prob):
+                    import random as _r
+                    return replacement if _r.random() < rp else m.group(0)
+                text = _re.sub(pattern, replace_some, text, flags=_re.IGNORECASE)
+
+            # Idioms (very sparse)
+            idioms_sparse = ["to be fair", "for what it's worth", "oddly enough", "now and then", "at times"]
+            sents = _re.split(r"(?<=[.!?])\s+", text)
+            varied = []
+            for i, sent in enumerate(sents):
+                if i > 0 and len(sent.split()) > 10 and i % 18 == 0:  # Very rare
+                    ins = idioms_sparse[i % len(idioms_sparse)]
+                    if not sent.lower().startswith(tuple(ins.lower() for ins in idioms_sparse)):
+                        sent = f"{ins}, " + sent[0].lower() + sent[1:]
+                varied.append(sent)
+            text = " ".join(varied)
+        
+        # 5. Sparse discourse markers (pass 3+, very low rate)
+        if pass_index >= 3:
+            markers = ['frankly,', 'honestly,', 'to be fair,', 'candidly,']
+            sents = _re.split(r"(?<=[.!?])\s+", text)
+            varied = []
+            for i, sent in enumerate(sents):
+                if i > 0 and len(sent.split()) > 8 and i % 15 == 0:  # very rare
+                    marker = markers[i % len(markers)]
+                    sent = marker + " " + sent[0].lower() + sent[1:]
                 varied.append(sent)
             text = " ".join(varied)
         
