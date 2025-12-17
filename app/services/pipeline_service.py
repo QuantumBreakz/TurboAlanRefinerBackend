@@ -28,9 +28,19 @@ class RefinementPipeline:
         self.model = model
 
         # Phase-0 configuration (defaults in code, can be overridden via env)
-        self.max_input_tokens: int = int(os.getenv("REFINER_MAX_INPUT_TOKENS", "0") or 0)
-        self.enable_domain_chunk: bool = os.getenv("REFINER_DOMAIN_CHUNK", "1") == "true" or os.getenv("REFINER_DOMAIN_CHUNK", "1") == "1"
-        self.enable_placeholders: bool = os.getenv("REFINER_PLACEHOLDERS", "0") == "true" or os.getenv("REFINER_PLACEHOLDERS", "0") == "1"
+        # OPTIMIZATION: Default to 6000 tokens per chunk for efficient parallel processing
+        # This allows large documents to be split and processed in parallel
+        self.max_input_tokens: int = int(os.getenv("REFINER_MAX_INPUT_TOKENS", "6000") or 6000)
+        self.enable_domain_chunk: bool = os.getenv("REFINER_DOMAIN_CHUNK", "1") in ("true", "1", "True", "TRUE")
+        self.enable_placeholders: bool = os.getenv("REFINER_PLACEHOLDERS", "0") in ("true", "1", "True", "TRUE")
+        
+        # Auto-chunk threshold: documents larger than this will be automatically chunked
+        # Default: 15000 chars (~4000 tokens) triggers chunking
+        self._auto_chunk_threshold = int(os.getenv("REFINER_AUTO_CHUNK_THRESHOLD", "15000") or 15000)
+        
+        # Local processing intensity: how much to do locally vs. send to LLM
+        # 0 = minimal local processing, 1 = maximum local processing
+        self._local_processing_intensity = float(os.getenv("REFINER_LOCAL_INTENSITY", "0.5") or 0.5)
         
         # Strategy analysis cache (class-level for performance)
         # Key: hash of (text_hash, heuristics_hash), Value: (weights, rationale, approach, plan)
@@ -42,10 +52,14 @@ class RefinementPipeline:
         # Default: enabled, can be disabled via REFINER_PARALLEL_CHUNKS=0
         parallel_chunks_env = os.getenv("REFINER_PARALLEL_CHUNKS", "1")
         self._enable_parallel_chunks = parallel_chunks_env in ("1", "true", "True", "TRUE")
-        # Default: 4 workers, override via REFINER_MAX_PARALLEL_WORKERS
-        self._max_parallel_workers = int(os.getenv("REFINER_MAX_PARALLEL_WORKERS", "4") or 4)
-        # Ensure at least 1 worker and at most 10 (safety limit)
-        self._max_parallel_workers = max(1, min(10, self._max_parallel_workers))
+        # Default: 6 workers for faster parallel processing (was 4)
+        self._max_parallel_workers = int(os.getenv("REFINER_MAX_PARALLEL_WORKERS", "6") or 6)
+        # Ensure at least 1 worker and at most 12 (safety limit)
+        self._max_parallel_workers = max(1, min(12, self._max_parallel_workers))
+        
+        # Progress callback for real-time updates (set per-job)
+        self._progress_callback: Optional[callable] = None
+        self._current_chunk_progress: Dict[str, int] = {}  # job_id -> completed chunks
         
         # CRITICAL FIX: Store original file extension for multi-pass processing (per job_id)
         # This ensures Word docs stay as Word docs across all passes
@@ -113,6 +127,21 @@ class RefinementPipeline:
         with self._job_lock:
             self._job_extensions.pop(job_id, None)
             self._job_file_types.pop(job_id, None)
+            self._current_chunk_progress.pop(job_id, None)
+    
+    def set_progress_callback(self, callback: callable) -> None:
+        """Set a callback function to report progress during long processing.
+        Callback signature: callback(job_id, stage, progress, message)
+        """
+        self._progress_callback = callback
+    
+    def _report_progress(self, job_id: str, stage: str, progress: float, message: str) -> None:
+        """Report progress if a callback is set."""
+        if self._progress_callback:
+            try:
+                self._progress_callback(job_id, stage, progress, message)
+            except Exception:
+                pass  # Don't let callback errors break processing
 
     _DOMAIN_SPLITS = [
         r"\n##\s*(Findings|Impression|Assessment|Plan)\b",
@@ -185,6 +214,68 @@ class RefinementPipeline:
         if cur:
             out.append(cur)
         return out if out else ["\n\n".join(sections)]
+
+    def _smart_chunk_text(self, text: str, target_chunk_size: int = 5000) -> List[str]:
+        """
+        Smart chunking that preserves paragraph and sentence boundaries.
+        Much faster than domain-aware chunking for general documents.
+        
+        Args:
+            text: Text to chunk
+            target_chunk_size: Target size in characters (not tokens, for speed)
+        
+        Returns:
+            List of text chunks
+        """
+        if not text or len(text) <= target_chunk_size:
+            return [text] if text else []
+        
+        chunks: List[str] = []
+        
+        # First, try to split by paragraphs (double newlines)
+        paragraphs = re.split(r'\n\s*\n', text)
+        
+        current_chunk = ""
+        for para in paragraphs:
+            para = para.strip()
+            if not para:
+                continue
+            
+            # If adding this paragraph keeps us under target, add it
+            if len(current_chunk) + len(para) + 2 <= target_chunk_size:
+                current_chunk = current_chunk + "\n\n" + para if current_chunk else para
+            else:
+                # Current chunk is full, save it
+                if current_chunk:
+                    chunks.append(current_chunk)
+                
+                # If this paragraph itself is too large, split by sentences
+                if len(para) > target_chunk_size:
+                    sentences = re.split(r'(?<=[.!?])\s+', para)
+                    sentence_chunk = ""
+                    for sent in sentences:
+                        if len(sentence_chunk) + len(sent) + 1 <= target_chunk_size:
+                            sentence_chunk = sentence_chunk + " " + sent if sentence_chunk else sent
+                        else:
+                            if sentence_chunk:
+                                chunks.append(sentence_chunk)
+                            # If single sentence is still too long, just add it
+                            sentence_chunk = sent
+                    if sentence_chunk:
+                        current_chunk = sentence_chunk
+                    else:
+                        current_chunk = ""
+                else:
+                    current_chunk = para
+        
+        if current_chunk:
+            chunks.append(current_chunk)
+        
+        return chunks if chunks else [text]
+
+    def _should_auto_chunk(self, text: str) -> bool:
+        """Determine if text should be automatically chunked based on size."""
+        return len(text) > self._auto_chunk_threshold
 
     _PH_LONG_ID = re.compile(r"\b(ICD-10|ICD-9)\s*[:：]?\s*[A-Z0-9\.\-]+|\b\d+\s+U\.S\.C\.\s*§\s*\w[\w\-\.()]*", re.IGNORECASE)
 
@@ -1888,24 +1979,46 @@ class RefinementPipeline:
             sys_full = "\n".join(sys_parts)
             print(f"_three_phase_refine: Calling LLM for phase {idx} (input length: {len(out)} chars)")
             model_name = self._get_model_name()
-            # Determine chunking
-            if self.enable_domain_chunk and self.max_input_tokens > 0:
-                sections = self._split_domain_sections(out)
-                chunks = self._pack_to_budget(sections, sys_full, model_name, self.max_input_tokens)
+            
+            # OPTIMIZATION: Smart auto-chunking for large documents
+            # This significantly speeds up processing by parallelizing LLM calls
+            should_chunk = self._should_auto_chunk(out) or (self.enable_domain_chunk and self.max_input_tokens > 0)
+            
+            if should_chunk:
+                if self.enable_domain_chunk:
+                    # Try domain-aware chunking first (for structured documents)
+                    sections = self._split_domain_sections(out)
+                    if len(sections) > 1:
+                        chunks = self._pack_to_budget(sections, sys_full, model_name, self.max_input_tokens)
+                        print(f"_three_phase_refine: Using domain-aware chunking: {len(chunks)} chunks")
+                    else:
+                        # Fall back to smart paragraph-based chunking
+                        # Target ~4000 chars per chunk for optimal parallelization
+                        chunks = self._smart_chunk_text(out, target_chunk_size=4000)
+                        print(f"_three_phase_refine: Using smart paragraph chunking: {len(chunks)} chunks")
+                else:
+                    # Use smart paragraph-based chunking
+                    chunks = self._smart_chunk_text(out, target_chunk_size=4000)
+                    print(f"_three_phase_refine: Using smart chunking: {len(chunks)} chunks")
             else:
                 chunks = [out]
+                print(f"_three_phase_refine: Document small enough, no chunking needed")
 
             # OPTIMIZATION: Process chunks in parallel for better performance
-            # Only parallelize if enabled and we have multiple chunks
-            use_parallel = (self._enable_parallel_chunks and 
-                           len(chunks) > 1 and 
-                           hasattr(self, '_current_job_id') and 
-                           self._current_job_id)
+            # Parallelize whenever we have multiple chunks (significant speedup for large docs)
+            use_parallel = self._enable_parallel_chunks and len(chunks) > 1
             
             if use_parallel:
                 print(f"_three_phase_refine: Processing {len(chunks)} chunks in parallel (max {self._max_parallel_workers} workers)")
                 generated_parts: List[str] = [""] * len(chunks)  # Pre-allocate list
                 cost_infos: List[dict] = []
+                total_chunks = len(chunks)
+                completed_count = [0]  # Use list for mutable counter across threads
+                
+                # Initialize chunk progress for this job
+                effective_job_id = getattr(self, '_current_job_id', None) or 'default'
+                with self._job_lock:
+                    self._current_chunk_progress[effective_job_id] = 0
                 
                 def process_chunk(chunk_idx: int, chunk: str) -> Tuple[int, str, dict]:
                     """Process a single chunk and return its index, generated text, and cost info."""
@@ -1971,6 +2084,19 @@ class RefinementPipeline:
                                 pass_used_in_tokens += int(cost_info.get('tokens_in', 0) or 0)
                             except Exception:
                                 pass
+                            
+                            # Report progress after each chunk completes
+                            completed_count[0] += 1
+                            with self._job_lock:
+                                self._current_chunk_progress[effective_job_id] = completed_count[0]
+                            progress_pct = (completed_count[0] / total_chunks) * 100
+                            self._report_progress(
+                                effective_job_id, 
+                                f"refine_phase_{idx}", 
+                                progress_pct,
+                                f"Processing chunk {completed_count[0]}/{total_chunks} ({progress_pct:.0f}%)"
+                            )
+                            print(f"_three_phase_refine: Completed chunk {completed_count[0]}/{total_chunks} ({progress_pct:.0f}%)")
                         except Exception as e:
                             print(f"_three_phase_refine: Error getting result from chunk processing: {e}")
                             # Continue with other chunks
