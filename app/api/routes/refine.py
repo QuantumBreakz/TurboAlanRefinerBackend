@@ -6,6 +6,7 @@ import uuid
 import time
 from typing import AsyncGenerator, Dict, Any, List, Optional
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 
 from fastapi import APIRouter, Request, HTTPException
 from fastapi.responses import JSONResponse
@@ -35,6 +36,11 @@ logger = get_logger('api.refine')
 
 MAX_REFINEMENT_PASSES = 10
 MAX_HEURISTICS_SIZE = 1024 * 1024
+
+# CRITICAL FIX: Dedicated thread pool for pipeline execution
+# This prevents blocking the main event loop and allows better resource management
+# Max 4 concurrent pipeline jobs to avoid overwhelming the system
+_pipeline_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="pipeline_worker")
 
 class RefinementRequest(BaseModel):
     files: List[Dict[str, Any]]
@@ -231,10 +237,21 @@ async def _validate_and_resolve_file_path(file_info: Dict[str, Any], file_id: st
     # Try to get file path from uploaded_files registry first
     # CRITICAL FIX: Check multiple possible file_id variations for multi-file support
     file_path = None
+    stored_file_type = None  # Track the original file type
     
     # First, try the exact file_id
     if file_id in uploaded_files:
-        file_path = uploaded_files[file_id].get("temp_path") or uploaded_files[file_id].get("path")
+        file_info_stored = uploaded_files[file_id]
+        file_path = file_info_stored.get("temp_path") or file_info_stored.get("path")
+        stored_file_type = file_info_stored.get("file_type")  # Preserve file type from upload
+        logger.debug(f"Found file by exact file_id: {file_id}, path: {file_path}, file_type: {stored_file_type}")
+        
+        # CRITICAL FIX: Verify extension matches stored file type
+        if file_path and stored_file_type:
+            actual_ext = os.path.splitext(file_path)[1].lower().lstrip('.')
+            if actual_ext != stored_file_type and stored_file_type in ['docx', 'doc', 'pdf']:
+                logger.warning(f"Extension mismatch for {file_id}: temp_path ext='{actual_ext}', file_type='{stored_file_type}'")
+                # The temp file should already have correct extension from upload, but log for debugging
     
     # If not found, try looking up by drive_id or other identifiers
     if not file_path:
@@ -442,11 +459,12 @@ async def _process_refinement_pass(
         safe_jobs_snapshot_set(job_id, plan_evt)
         logger.debug(f"Emitted plan event for pass {pass_num}: {plan_evt}")
         
-        # Run the pipeline pass in executor to avoid blocking event loop
+        # Run the pipeline pass in dedicated executor to avoid blocking event loop
+        # CRITICAL FIX: Use dedicated thread pool for better resource management
         logger.debug(f"About to call pipeline.run_pass for pass {pass_num}")
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         ps, rr, ft = await loop.run_in_executor(
-            None,  # Use default ThreadPoolExecutor
+            _pipeline_executor,  # Use dedicated pipeline thread pool
             lambda: pipeline.run_pass(
                 input_path=file_path,
                 pass_index=pass_num,
@@ -774,16 +792,34 @@ async def _refine_stream(request: RefinementRequest, job_id: str) -> AsyncGenera
                     
                     # Process the pass (this internally calls pipeline.run_pass)
                     # CRITICAL FIX: Removed duplicate run_pass call - _process_refinement_pass already calls it
-                    success, refined_text, metrics, ps, rr = await _process_refinement_pass(
-                        pipeline, 
-                        file_path, 
-                        current_text, 
-                        pass_num, 
-                        request, 
-                        file_id, 
-                        job_id,
-                        output_sink
-                    )
+                    # CRITICAL FIX: Add timeout to prevent indefinite hanging
+                    pass_timeout_seconds = 20 * 60  # 20 minutes max per pass (generous for large docs)
+                    try:
+                        async with asyncio.timeout(pass_timeout_seconds):
+                            success, refined_text, metrics, ps, rr = await _process_refinement_pass(
+                                pipeline, 
+                                file_path, 
+                                current_text, 
+                                pass_num, 
+                                request, 
+                                file_id, 
+                                job_id,
+                                output_sink
+                            )
+                    except asyncio.TimeoutError:
+                        logger.error(f"Pass {pass_num} timed out after {pass_timeout_seconds} seconds")
+                        timeout_evt = {'type': 'error', 'jobId': job_id, 'fileId': file_id, 'fileName': file_name, 'pass': pass_num, 'error': f'Pass {pass_num} timed out after {pass_timeout_seconds // 60} minutes. The document may be too large or complex.'}
+                        try:
+                            await ws_manager.broadcast(job_id, timeout_evt)  # type: ignore
+                        except Exception:
+                            pass
+                        jobs_snapshot[job_id] = timeout_evt
+                        try:
+                            upsert_job(job_id, {"current_stage": "timeout", "status": "failed", "error": timeout_evt.get("error")})
+                        except Exception:
+                            pass
+                        yield f"{safe_encoder(timeout_evt)}\n\n"
+                        break  # Stop processing this file on timeout
                     
                     # Get the final text from refined_text
                     ft = refined_text
@@ -991,12 +1027,32 @@ async def _refine_stream(request: RefinementRequest, job_id: str) -> AsyncGenera
                     except Exception:
                         pass
                     jobs_snapshot[job_id] = err2
-                    try:
-                        upsert_job(job_id, {"current_stage": "error", "status": "failed", "error": err2.get("error")})
-                    except Exception:
-                        pass
-                    yield f"{safe_encoder(err2)}\n\n"
-                    log_exception("REFINEMENT_STREAM_ERROR", e)
+                    
+                    # CRITICAL FIX: Determine if error is recoverable
+                    # For recoverable errors, continue to next pass; for fatal errors, break
+                    is_fatal_error = any(fatal in error_msg.lower() for fatal in [
+                        'file not found', 'permission denied', 'timeout', 
+                        'out of memory', 'quota exceeded', 'api key'
+                    ])
+                    
+                    if is_fatal_error:
+                        try:
+                            upsert_job(job_id, {"current_stage": "error", "status": "failed", "error": err2.get("error")})
+                        except Exception:
+                            pass
+                        yield f"{safe_encoder(err2)}\n\n"
+                        log_exception("REFINEMENT_STREAM_ERROR_FATAL", e)
+                        break  # Stop processing this file on fatal errors
+                    else:
+                        # Non-fatal error: log warning but try to continue
+                        try:
+                            upsert_job(job_id, {"current_stage": "error_recovered", "status": "running", "last_error": err2.get("error")})
+                        except Exception:
+                            pass
+                        yield f"{safe_encoder(err2)}\n\n"
+                        log_exception("REFINEMENT_STREAM_ERROR_RECOVERED", e)
+                        # Continue to next pass - the text will be current_text (last good version)
+                        continue
             
             # CRITICAL FIX: After pass loop completes, emit file completion event
             # This ensures the frontend knows the file processing is done
@@ -1065,6 +1121,29 @@ async def _refine_stream(request: RefinementRequest, job_id: str) -> AsyncGenera
         # Signal explicit error completion for SSE consumers
         yield "event: error\ndata: {}\n\n"
         log_exception("REFINEMENT_STREAM_FATAL", e)
+    finally:
+        # CRITICAL FIX: Always emit stream_end event to ensure frontend knows processing is done
+        # This helps prevent indefinite "processing" states in the UI
+        try:
+            stream_end_evt = {'type': 'stream_end', 'jobId': job_id, 'message': 'Stream processing finished'}
+            try:
+                await ws_manager.broadcast(job_id, stream_end_evt)  # type: ignore
+            except Exception:
+                pass
+            yield f"{safe_encoder(stream_end_evt)}\n\n"
+            # Also emit SSE-style end event
+            yield "event: stream_end\ndata: {}\n\n"
+        except Exception as cleanup_error:
+            logger.error(f"Failed to emit stream_end event: {cleanup_error}")
+        
+        # CRITICAL FIX: Clean up job-specific pipeline data to prevent memory leaks
+        try:
+            pipeline = get_pipeline()
+            if pipeline and hasattr(pipeline, 'cleanup_job_data'):
+                pipeline.cleanup_job_data(job_id)
+                logger.debug(f"Cleaned up pipeline job data for job {job_id}")
+        except Exception as cleanup_error:
+            logger.debug(f"Failed to cleanup pipeline job data: {cleanup_error}")
 
 async def run_job_background(req: RefinementRequest, job_id: str) -> None:
     try:
