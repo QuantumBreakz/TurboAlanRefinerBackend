@@ -600,7 +600,8 @@ async def _process_refinement_pass(
         
     except Exception as e:
         error_msg = str(e).replace('"', '\\"').replace('\n', '\\n').replace('\r', '\\r')
-        err2 = {'type': 'error', 'jobId': job_id, 'fileId': file_id, 'pass': pass_num, 'error': error_msg}
+        # Include the actual error message in the event so users can see what went wrong
+        err2 = {'type': 'error', 'jobId': job_id, 'fileId': file_id, 'pass': pass_num, 'error': f'Pass {pass_num} failed: {error_msg}'}
         try:
             await ws_manager.broadcast(job_id, err2)  # type: ignore
         except Exception:
@@ -610,8 +611,9 @@ async def _process_refinement_pass(
             upsert_job(job_id, {"current_stage": "error", "status": "failed", "error": err2.get("error")})
         except Exception:
             pass
-        logger.error(f"Pass {pass_num} failed: {e}")
-        return False, current_text, {}, None, None
+        logger.error(f"Pass {pass_num} failed: {e}", exc_info=True)  # Include stack trace
+        # Return the error message so the caller can use it
+        return False, current_text, {'error': error_msg}, None, None
 
 async def _refine_stream(request: RefinementRequest, job_id: str) -> AsyncGenerator[str, None]:
     logger.debug(f"Starting refinement stream for job {job_id}")
@@ -668,8 +670,8 @@ async def _refine_stream(request: RefinementRequest, job_id: str) -> AsyncGenera
                     # Read and validate file content
                     original_text = await _read_and_validate_file(file_path, file_id, job_id)
                     
-                    # Yield the read completion message
-                    msg = {'type': 'stage_update', 'jobId': job_id, 'fileId': file_id, 'fileName': file_name, 'stage': 'read', 'status': 'completed', 'message': f'Read {len(original_text)} characters'}
+                    # Yield the read completion message - include inputChars for frontend
+                    msg = {'type': 'stage_update', 'jobId': job_id, 'fileId': file_id, 'fileName': file_name, 'stage': 'read', 'status': 'completed', 'message': f'Read {len(original_text)} characters', 'inputChars': len(original_text)}
                     yield f"{safe_encoder(msg)}\n\n"
                 
             except APIError as e:
@@ -835,17 +837,31 @@ async def _refine_stream(request: RefinementRequest, job_id: str) -> AsyncGenera
                     # Get the final text from refined_text
                     ft = refined_text
                     
-                    # If pipeline state is None (error case), skip stage updates
+                    # If pipeline state is None (error case), skip stage updates but show actual error
                     if ps is None:
-                        logger.error(f"Pipeline state is None for pass {pass_num}, skipping stage updates")
-                        # Don't break - continue to next pass or emit error
-                        error_evt = {'type': 'error', 'jobId': job_id, 'fileId': file_id, 'fileName': file_name, 'pass': pass_num, 'error': 'Pipeline state is None - pass may have failed'}
+                        # Get actual error from metrics if available (we store it there on failure)
+                        actual_error = metrics.get('error', 'Unknown error during pass processing') if isinstance(metrics, dict) else 'Unknown error during pass processing'
+                        logger.error(f"Pipeline state is None for pass {pass_num}, error: {actual_error}")
+                        # Don't emit another error - _process_refinement_pass already emitted one with the actual error
+                        # Just log and continue to next pass
+                        # If we want to emit pass info even on failure, emit partial pass_complete
+                        partial_evt = {
+                            'type': 'pass_complete',
+                            'jobId': job_id,
+                            'fileId': file_id,
+                            'fileName': file_name,
+                            'pass': pass_num,
+                            'metrics': {'error': actual_error, 'success': False},
+                            'inputChars': len(current_text),
+                            'outputChars': len(refined_text) if refined_text else 0,
+                            'error': actual_error
+                        }
                         try:
-                            await ws_manager.broadcast(job_id, error_evt)  # type: ignore
+                            await ws_manager.broadcast(job_id, partial_evt)  # type: ignore
                         except Exception:
                             pass
-                        jobs_snapshot[job_id] = error_evt
-                        yield f"{safe_encoder(error_evt)}\n\n"
+                        jobs_snapshot[job_id] = partial_evt
+                        yield f"{safe_encoder(partial_evt)}\n\n"
                         # Continue to next pass instead of breaking
                         continue
 
