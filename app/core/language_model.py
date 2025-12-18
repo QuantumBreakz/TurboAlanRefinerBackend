@@ -24,16 +24,12 @@ OPENAI_PRICING = {
         'output': 0.03  # $0.03 per 1K tokens
     },
     'gpt-4o': {
-        'input': 0.0025,  # $0.0025 per 1K tokens (updated pricing)
-        'output': 0.01    # $0.01 per 1K tokens (updated pricing)
-    },
-    'gpt-4o-mini': {
-        'input': 0.00015,  # $0.00015 per 1K tokens (very cheap!)
-        'output': 0.0006   # $0.0006 per 1K tokens
+        'input': 0.005,  # $0.005 per 1K tokens
+        'output': 0.015  # $0.015 per 1K tokens
     },
     'gpt-3.5-turbo': {
-        'input': 0.0005,  # $0.0005 per 1K tokens (updated pricing)
-        'output': 0.0015  # $0.0015 per 1K tokens
+        'input': 0.0015,  # $0.0015 per 1K tokens
+        'output': 0.002   # $0.002 per 1K tokens
     }
 }
 
@@ -290,10 +286,8 @@ class OpenAIModel:
         from openai import OpenAI
         self.client = OpenAI(api_key=api_key)
         self.model = model
-        # Track request timeout (configurable via env)
-        self._request_timeout = int(os.getenv("OPENAI_REQUEST_TIMEOUT", "120"))  # 2 min default
 
-    def generate(self, system: str, user: str, temperature: float = 0.4, max_tokens: int = 2000, job_id: str = None, user_id: str = None, fast_mode: bool = False) -> tuple[str, dict]:
+    def generate(self, system: str, user: str, temperature: float = 0.4, max_tokens: int = 2000, job_id: str = None, user_id: str = None) -> tuple[str, dict]:
         t0 = time.perf_counter()
         
         def _estimate_max_chars_for_model(model: str, max_input_tokens: int = 7000) -> int:
@@ -323,22 +317,15 @@ class OpenAIModel:
             if pre_tokens > max_in:
                 raise ValueError(f"TOKEN_BEDGET_EXCEEDED: {pre_tokens}>{max_in}")
 
-        # Use model override for fast mode (cheaper, faster model)
-        use_model = self.model
-        if fast_mode:
-            # Use gpt-4o-mini for faster/cheaper processing in fast mode
-            use_model = os.getenv("OPENAI_FAST_MODEL", "gpt-4o-mini")
-        
         try:
             resp = self.client.chat.completions.create(
-                model=use_model,
+                model=self.model,
                 messages=[
                     {"role": "system", "content": system},
                     {"role": "user", "content": attempt_user},
                 ],
                 temperature=temperature,
                 max_tokens=max_tokens,
-                timeout=self._request_timeout,  # Add timeout to prevent hanging
             )
         except Exception as e:
             # Handle context length exceeded by retrying with more aggressive truncation
@@ -349,14 +336,13 @@ class OpenAIModel:
                     try:
                         reduced = _truncate_text(user, int(max_chars * factor))
                         resp = self.client.chat.completions.create(
-                            model=use_model,
+                            model=self.model,
                             messages=[
                                 {"role": "system", "content": system},
                                 {"role": "user", "content": reduced},
                             ],
                             temperature=temperature,
                             max_tokens=max_tokens,
-                            timeout=self._request_timeout,
                         )
                         break
                     except Exception as inner_e:
@@ -386,12 +372,10 @@ class OpenAIModel:
             used_out = 0
         
         # Normalize model name for pricing lookup (handle variations like "gpt-4o", "gpt-4-turbo", etc.)
-        model_name = use_model  # Use the actual model that was used (could be different in fast_mode)
-        if model_name.startswith("gpt-4o-mini"):
-            model_name = "gpt-4o-mini"
-        elif model_name.startswith("gpt-4o"):
+        model_name = self.model
+        if model_name.startswith("gpt-4o"):
             model_name = "gpt-4o"
-        elif model_name.startswith("gpt-4-turbo"):
+        elif model_name.startswith("gpt-4-turbo") or model_name.startswith("gpt-4-turbo"):
             model_name = "gpt-4-turbo"
         elif model_name.startswith("gpt-4"):
             model_name = "gpt-4"
