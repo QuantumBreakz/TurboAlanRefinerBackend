@@ -67,6 +67,7 @@ class RefinementPipeline:
         import threading
         self._job_extensions: Dict[str, str] = {}  # job_id -> original extension
         self._job_file_types: Dict[str, str] = {}  # job_id -> original file type
+        self._job_original_paths: Dict[str, str] = {}  # job_id -> original file path (for style skeleton extraction)
         self._job_lock = threading.Lock()  # Thread-safe access to job-specific data
         
         # Cleanup old job data after 2 hours (prevents memory leaks)
@@ -108,6 +109,11 @@ class RefinementPipeline:
         with self._job_lock:
             return self._job_file_types.get(job_id, 'txt')
     
+    def _get_job_original_path(self, job_id: str) -> str | None:
+        """Get the original file path for a job (thread-safe)."""
+        with self._job_lock:
+            return self._job_original_paths.get(job_id)
+    
     def _cleanup_old_job_data(self) -> None:
         """Remove job data older than max age to prevent memory leaks.
         Must be called while holding _job_lock."""
@@ -120,6 +126,7 @@ class RefinementPipeline:
             for key in keys_to_remove:
                 self._job_extensions.pop(key, None)
                 self._job_file_types.pop(key, None)
+                self._job_original_paths.pop(key, None)
             print(f"PIPELINE: Cleaned up {len(keys_to_remove)} old job extension entries")
     
     def cleanup_job_data(self, job_id: str) -> None:
@@ -127,6 +134,7 @@ class RefinementPipeline:
         with self._job_lock:
             self._job_extensions.pop(job_id, None)
             self._job_file_types.pop(job_id, None)
+            self._job_original_paths.pop(job_id, None)
             self._current_chunk_progress.pop(job_id, None)
     
     def set_progress_callback(self, callback: callable) -> None:
@@ -422,14 +430,15 @@ class RefinementPipeline:
                 else:
                     file_type = 'txt'
                 
-                # Thread-safe storage of job-specific extension data
+                # Thread-safe storage of job-specific extension data and original path
                 with self._job_lock:
                     self._job_extensions[effective_job_id] = original_ext
                     self._job_file_types[effective_job_id] = file_type
+                    self._job_original_paths[effective_job_id] = input_path  # Store original file path
                     # Cleanup old job data to prevent memory leaks
                     self._cleanup_old_job_data()
                 
-                print(f"PIPELINE: Captured original extension for job {effective_job_id}: {original_ext}, type: {file_type}")
+                print(f"PIPELINE: Captured original extension for job {effective_job_id}: {original_ext}, type: {file_type}, path: {input_path}")
             else:
                 # No extension found, default to .txt
                 with self._job_lock:
@@ -697,13 +706,20 @@ class RefinementPipeline:
         # Log the extension being used for debugging
         print(f"PIPELINE: Writing pass {pass_index} output for job {effective_job_id} with extension: {ext}, base: {base}")
         
+        # CRITICAL FIX: Use stored original file path for style skeleton extraction
+        # On subsequent passes, input_path might be a .txt file from previous pass
+        # We need the original file path to extract DOCX formatting/style skeleton
+        original_file_path = self._get_job_original_path(effective_job_id) or input_path
+        if original_file_path != input_path:
+            print(f"PIPELINE: Using stored original file path for style extraction: {original_file_path} (current input: {input_path})")
+        
         output_dir = os.getenv("TMPDIR", os.getenv("TEMP", "/tmp"))
         local_out = write_text_to_file(
             text=final_norm,
             output_dir=output_dir,
             base_name=base,
             ext=ext,
-            original_file=input_path,
+            original_file=original_file_path,  # Use original file path, not current input_path
             iteration=pass_index,
         )
         print(f"PIPELINE: Output written to: {local_out}")
@@ -2064,6 +2080,16 @@ class RefinementPipeline:
                                 gen_txt = self._restore_placeholders(gen_txt if isinstance(gen_txt, str) else gen_txt[0], ph_map)
                             except Exception:
                                 pass
+                        
+                        # Normalize gen_txt
+                        if isinstance(gen_txt, tuple):
+                            gen_txt = gen_txt[0]
+                        
+                        return chunk_idx, str(gen_txt), cost_info, pre_tokens
+                    except Exception as e:
+                        # If chunk processing fails, return error info but don't crash the whole pass
+                        print(f"_three_phase_refine: Error processing chunk {chunk_idx}: {e}")
+                        return chunk_idx, "", {'total_cost': 0, 'tokens_in': 0, 'tokens_out': 0}, 0
 
                 # Process chunks in parallel using ThreadPoolExecutor
                 with ThreadPoolExecutor(max_workers=self._max_parallel_workers) as executor:
@@ -2126,9 +2152,7 @@ class RefinementPipeline:
                             adaptive_max_tokens = 2000  # Fallback to default
                         gen_txt, cost_info = self.model.generate(
                             system=sys_full, user=payload, temperature=temp, max_tokens=adaptive_max_tokens, 
-                            job_id=self._current_job_id, user_id=getattr(self, '_current_user_id', None),
-                            pass_num=getattr(self, '_current_pass_index', 1),
-                            total_passes=getattr(self, '_current_total_passes', 1)
+                            job_id=self._current_job_id, user_id=getattr(self, '_current_user_id', None)
                         )
                         if not hasattr(self, '_pass_costs'):
                             self._pass_costs = []
@@ -2149,9 +2173,7 @@ class RefinementPipeline:
                             adaptive_max_tokens = 2000  # Fallback to default
                         result = self.model.generate(
                             system=sys_full, user=payload, temperature=temp, max_tokens=adaptive_max_tokens, 
-                            user_id=getattr(self, '_current_user_id', None),
-                            pass_num=getattr(self, '_current_pass_index', 1),
-                            total_passes=getattr(self, '_current_total_passes', 1)
+                            user_id=getattr(self, '_current_user_id', None)
                         )
                         if isinstance(result, tuple):
                             gen_txt, cost_info = result

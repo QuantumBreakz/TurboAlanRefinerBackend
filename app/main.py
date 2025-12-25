@@ -32,6 +32,7 @@ from app.core.strategy_feedback import strategy_feedback_manager, StrategyFeedba
 from app.core.errors import APIError, create_error_response
 from app.core.dependencies import get_settings, get_pipeline, get_model
 from app.core.memory_manager import memory_manager
+from app.core.conversation_manager import conversation_manager
 from app.core.state import (
     uploaded_files, jobs_snapshot, active_tasks, rate_limit_storage,
     safe_uploaded_files_get, safe_uploaded_files_set, safe_uploaded_files_del,
@@ -1210,9 +1211,7 @@ async def upload_file(file: UploadFile = File(...)) -> FileUploadResponse:
             except OSError:
                 pass
         raise APIError(f"File upload failed: {str(e)}", 500, "FILE_UPLOAD_ERROR")
-    finally:
-        # Always close the upload file handle to prevent resource leaks
-        await file.close()
+    # Note: FastAPI's UploadFile handles cleanup automatically, no need to close manually
 
 # Enhanced file download with format conversion
 @app.post("/files/download")
@@ -1311,7 +1310,53 @@ async def serve_file_by_name(filename: str):
                             if filename in output_path or os.path.basename(output_path) == filename:
                                 text_content = job_data.get('textContent')
                                 if text_content:
-                                    # Return text content directly
+                                    # Check file extension to determine format
+                                    file_ext = Path(filename).suffix.lower()
+                                    original_ext = job_data.get('originalExtension', file_ext)
+                                    original_file_path = job_data.get('originalFilePath')
+                                    
+                                    # If it's a DOCX file, convert text to DOCX format
+                                    if file_ext == '.docx' or original_ext == '.docx':
+                                        try:
+                                            from app.utils.utils import write_text_to_file
+                                            import tempfile
+                                            # Create temporary DOCX file
+                                            with tempfile.NamedTemporaryFile(delete=False, suffix='.docx') as tmp:
+                                                temp_docx_path = tmp.name
+                                            
+                                            # Write text to DOCX using original file for style extraction
+                                            docx_path = write_text_to_file(
+                                                text=text_content,
+                                                output_dir=os.path.dirname(temp_docx_path),
+                                                base_name=Path(filename).stem,
+                                                ext='.docx',
+                                                original_file=original_file_path if original_file_path and os.path.exists(original_file_path) else None,
+                                                iteration=1
+                                            )
+                                            
+                                            # Read the DOCX file and return it
+                                            with open(docx_path, 'rb') as f:
+                                                docx_content = f.read()
+                                            
+                                            # Clean up temp file
+                                            try:
+                                                os.unlink(docx_path)
+                                            except Exception:
+                                                pass
+                                            
+                                            return StreamingResponse(
+                                                io.BytesIO(docx_content),
+                                                media_type='application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+                                                headers={
+                                                    "Content-Disposition": f'attachment; filename="{filename}"',
+                                                    "Cache-Control": "no-cache, no-store, must-revalidate",
+                                                }
+                                            )
+                                        except Exception as e:
+                                            logger.warning(f"Failed to convert text to DOCX for {filename}: {e}, falling back to plain text")
+                                            # Fall through to plain text response
+                                    
+                                    # Return text content as plain text for other formats
                                     return StreamingResponse(
                                         io.BytesIO(text_content.encode('utf-8')),
                                         media_type='text/plain; charset=utf-8',
@@ -1669,6 +1714,14 @@ async def _process_refinement_pass(
             }
         
         # Emit pass complete event
+        # Get original file path and extension for format preservation
+        # Try to get from pipeline's stored original path (for multi-pass jobs)
+        original_file_path = file_path
+        if pipeline and hasattr(pipeline, '_get_job_original_path') and job_id:
+            stored_original = pipeline._get_job_original_path(job_id)
+            if stored_original:
+                original_file_path = stored_original
+        original_ext = os.path.splitext(original_file_path)[1] if original_file_path else None
         pc_evt = {
             'type': 'pass_complete', 
             'jobId': job_id, 
@@ -1678,7 +1731,10 @@ async def _process_refinement_pass(
             'inputChars': len(current_text),
             'outputChars': len(ft),
             'outputPath': rr.local_path if hasattr(rr, 'local_path') and rr.local_path else None,
-            'cost': pass_cost_info
+            'cost': pass_cost_info,
+            'textContent': ft,  # Include textContent for downloads
+            'originalFilePath': original_file_path,  # Store original file path for style extraction
+            'originalExtension': original_ext  # Store original extension for format preservation
         }
         try:
             await ws_manager.broadcast(job_id, pc_evt)  # type: ignore
@@ -1727,7 +1783,13 @@ async def chat(request: ChatRequest):
     if not api_key:
         return JSONResponse({"error": "OPENAI_API_KEY not configured"}, status_code=500)
     try:
-        refiner = ConversationalRefiner(api_key)
+        # Load conversation history for this user
+        # Try to load from MongoDB first, fallback to in-memory
+        conversation_manager.load_from_mongodb(request.user_id, mongodb_db)
+        conversation_history = conversation_manager.get_messages(request.user_id)
+        
+        # Create refiner with conversation history
+        refiner = ConversationalRefiner(api_key, conversation_history=conversation_history)
         if request.schema_levels:
             refiner.schema_levels = {str(k): int(v) for k, v in request.schema_levels.items()}
         
@@ -1751,8 +1813,36 @@ async def chat(request: ChatRequest):
                 enhanced_message = request.message
         else:
             enhanced_message = request.message
+        
+        # Get chat reply (this will add messages to refiner.messages)
         reply = refiner.chat(enhanced_message, flags=request.flags)
-        return {"reply": reply, "memory_context": memory_context, "schema_info": {"active_schemas": [{"name": k, "description": ADVANCED_COMMANDS[k]["description"]} for k in request.flags.keys() if k in ADVANCED_COMMANDS], "available_schemas": list(ADVANCED_COMMANDS.keys())}}
+        
+        # Save updated conversation history
+        # Get the updated messages from refiner
+        updated_messages = refiner.get_messages()
+        
+        # Update conversation manager with new messages
+        # Clear and rebuild to ensure consistency
+        conversation_manager.clear_conversation(request.user_id)
+        for msg in updated_messages:
+            conversation_manager.add_message(request.user_id, msg["role"], msg["content"])
+        
+        # Try to save to MongoDB (non-blocking, fails gracefully)
+        try:
+            conversation_manager.save_to_mongodb(request.user_id, mongodb_db)
+        except Exception as e:
+            # Log but don't fail the request if MongoDB save fails
+            logger.warning(f"Failed to save conversation to MongoDB: {e}")
+        
+        return {
+            "reply": reply, 
+            "memory_context": memory_context, 
+            "conversation_length": len(updated_messages),
+            "schema_info": {
+                "active_schemas": [{"name": k, "description": ADVANCED_COMMANDS[k]["description"]} for k in request.flags.keys() if k in ADVANCED_COMMANDS], 
+                "available_schemas": list(ADVANCED_COMMANDS.keys())
+            }
+        }
     except Exception as e:
         from app.core.logger import log_exception; log_exception("CHAT_API_ERROR", e)
         return JSONResponse({"error": str(e)}, status_code=500)
@@ -1845,6 +1935,49 @@ async def import_memory(user_id: str, request: Request):
     except Exception as e:
         from app.core.logger import log_exception; log_exception("MEMORY_IMPORT_ERROR", e)
         raise HTTPException(500, f"Failed to import memory: {str(e)}")
+
+@app.post("/chat/{user_id}/clear")
+async def clear_conversation(user_id: str):
+    """Clear conversation history for a user"""
+    try:
+        conversation_manager.clear_conversation(user_id)
+        # Also try to clear from MongoDB
+        if mongodb_db.is_connected():
+            try:
+                collection = mongodb_db._db.conversations if mongodb_db._db else None
+                if collection:
+                    collection.delete_one({"user_id": user_id})
+            except Exception as e:
+                logger.warning(f"Failed to clear conversation from MongoDB: {e}")
+        
+        return {
+            "success": True,
+            "user_id": user_id,
+            "message": "Conversation history cleared successfully"
+        }
+    except Exception as e:
+        from app.core.logger import log_exception
+        log_exception("CLEAR_CONVERSATION_ERROR", e)
+        raise HTTPException(500, f"Failed to clear conversation: {str(e)}")
+
+@app.get("/chat/{user_id}/history")
+async def get_conversation_history(user_id: str, limit: Optional[int] = None):
+    """Get conversation history for a user"""
+    try:
+        # Try to load from MongoDB first
+        conversation_manager.load_from_mongodb(user_id, mongodb_db)
+        messages = conversation_manager.get_messages(user_id, limit=limit)
+        
+        return {
+            "user_id": user_id,
+            "message_count": len(messages),
+            "messages": messages,
+            "has_history": len(messages) > 0
+        }
+    except Exception as e:
+        from app.core.logger import log_exception
+        log_exception("GET_CONVERSATION_HISTORY_ERROR", e)
+        raise HTTPException(500, f"Failed to get conversation history: {str(e)}")
 
 @app.get("/schema")
 async def get_schema_info():

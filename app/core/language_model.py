@@ -13,6 +13,16 @@ try:  # optional dependency for token budgeting
 except Exception:  # pragma: no cover
     tiktoken = None
 
+# Cost Limit Exception
+class CostLimitExceeded(Exception):
+    """Exception raised when cost limit is exceeded"""
+    def __init__(self, message: str, current_cost: float = 0.0, limit: float = 0.0, limit_type: str = "unknown"):
+        self.message = message
+        self.current_cost = current_cost
+        self.limit = limit
+        self.limit_type = limit_type
+        super().__init__(self.message)
+
 # OpenAI Pricing (as of 2024)
 OPENAI_PRICING = {
     'gpt-4': {
@@ -313,7 +323,7 @@ class OpenAIModel:
                 enc = tiktoken.encoding_for_model(self.model)
             except Exception:
                 enc = tiktoken.get_encoding("cl100k_base")
-            pre_tokens = len(enc.encode(system)) + len(enc.encode(attempted_user if 'attempted_user' in locals() else attempt_user))
+            pre_tokens = len(enc.encode(system)) + len(enc.encode(attempt_user))
             if pre_tokens > max_in:
                 raise ValueError(f"TOKEN_BEDGET_EXCEEDED: {pre_tokens}>{max_in}")
 
@@ -324,7 +334,7 @@ class OpenAIModel:
             use_model = os.getenv("OPENAI_FAST_MODEL", "gpt-4o-mini")
         try:
             resp = self.client.chat.completions.create(
-                model=self.model,
+                model=use_model,  # Use use_model instead of self.model
                 messages=[
                     {"role": "system", "content": system},
                     {"role": "user", "content": attempt_user},
@@ -341,7 +351,7 @@ class OpenAIModel:
                     try:
                         reduced = _truncate_text(user, int(max_chars * factor))
                         resp = self.client.chat.completions.create(
-                            model=self.model,
+                            model=use_model,  # Use use_model instead of self.model
                             messages=[
                                 {"role": "system", "content": system},
                                 {"role": "user", "content": reduced},

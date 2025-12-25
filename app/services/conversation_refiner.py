@@ -3,10 +3,11 @@ from openai import OpenAI
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 
 class ConversationalRefiner:
-    def __init__(self, api_key):
+    def __init__(self, api_key, conversation_history: List[Dict[str, str]] = None):
         self.api_key = api_key
         self.client = OpenAI(api_key=api_key)
-        self.messages = []
+        # Initialize messages with conversation history if provided
+        self.messages = conversation_history.copy() if conversation_history else []
         self.score = None
         self.conversation_context = {
             "current_file": None,
@@ -409,13 +410,22 @@ class ConversationalRefiner:
         if self.score:
             prompt += "\n" + self._score_hint()
 
-        context_gate = (
-            "IMPORTANT: Do not rewrite anything unless the user explicitly asks you to rewrite, revise, or propose edits.\n"
-            "If this is feedback or a question, only respond with insight or advice.\n"
-            "Consider the conversation context when providing responses.\n"
-            "If the user is referring to a specific file or pass, acknowledge it in your response."
-        )
-        self.messages.append({"role": "user", "content": context_gate + "\n" + prompt})
+        # Add system message if this is the start of a conversation
+        if not self.messages or not any(m.get("role") == "system" for m in self.messages):
+            system_message = (
+                "You are Turbo Alan Refiner, an AI assistant specialized in text refinement and AI detection reduction. "
+                "You help users refine their text to make it more human-like while maintaining meaning and quality. "
+                "You can answer questions about refinement strategies, schema controls, and provide guidance on improving text. "
+                "IMPORTANT: Do not rewrite anything unless the user explicitly asks you to rewrite, revise, or propose edits. "
+                "If this is feedback or a question, only respond with insight or advice. "
+                "Consider the conversation context when providing responses. "
+                "If the user is referring to a specific file or pass, acknowledge it in your response. "
+                "Maintain a helpful, conversational tone and remember previous messages in the conversation."
+            )
+            self.messages.insert(0, {"role": "system", "content": system_message})
+        
+        # Add user message with context
+        self.messages.append({"role": "user", "content": prompt})
 
         reply = self._safe_chat_completion(self.messages, model="gpt-4", temperature=0.7, timeout_seconds=30)
 
@@ -434,8 +444,13 @@ class ConversationalRefiner:
             except Exception:
                 # Fail open: if humanization fails, return the original reply
                 pass
+        # Add assistant reply to conversation history
         self.messages.append({"role": "assistant", "content": reply})
         return reply
+    
+    def get_messages(self) -> List[Dict[str, str]]:
+        """Get current conversation messages"""
+        return self.messages.copy()
 
     def set_flags(self, flags: dict):
         self.last_flags = flags

@@ -5,7 +5,7 @@ import json
 import uuid
 import time
 from datetime import datetime
-from typing import AsyncGenerator, Dict, Any, List, Optional
+from typing import AsyncGenerator, Dict, Any, List, Optional, Union
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 
@@ -144,8 +144,21 @@ def apply_preset_to_request(request: "RefinementRequest", preset_name: str) -> "
         request.passes = preset.get("passes", 1)
     if request.entropy_level == "medium":  # Default value
         request.entropy_level = preset.get("entropy_level", "medium")
-    if request.aggressiveness == 5:  # Default value
-        request.aggressiveness = preset.get("aggressiveness", 5)
+    # Check if aggressiveness is still default (normalized to "Auto" or original int 5)
+    if request.aggressiveness == 5 or request.aggressiveness == "Auto":  # Default value
+        preset_aggr = preset.get("aggressiveness", 5)
+        # Normalize preset aggressiveness if it's an int
+        if isinstance(preset_aggr, int):
+            if preset_aggr <= 2:
+                request.aggressiveness = "Low"
+            elif preset_aggr <= 4:
+                request.aggressiveness = "Medium"
+            elif preset_aggr <= 6:
+                request.aggressiveness = "High"
+            else:
+                request.aggressiveness = "Very High"
+        else:
+            request.aggressiveness = preset_aggr
     
     # Merge heuristics (preset values as defaults, request values override)
     preset_heuristics = preset.get("heuristics", {})
@@ -236,7 +249,7 @@ class RefinementRequest(BaseModel):
     settings: Dict[str, Any] = {}
     user_id: str = "default"
     use_memory: bool = True
-    aggressiveness: int = 5  # Changed to int for preset compatibility
+    aggressiveness: Union[int, str] = 5  # Accept both int and string (e.g., "very-high", "auto")
     earlyStop: bool = True
     scannerRisk: int = 15
     keywords: List[str] = []
@@ -277,13 +290,34 @@ class RefinementRequest(BaseModel):
                 ent = "medium"
             self.entropy_level = ent
 
-            # aggressiveness: case-insensitive
-            ag = (self.aggressiveness or "Auto").strip()
-            ag_norm = ag.lower()
-            if ag_norm in ("auto", "low", "medium", "high"):
-                self.aggressiveness = ag_norm.capitalize()
+            # aggressiveness: normalize from int or string to string
+            if isinstance(self.aggressiveness, int):
+                # Map integer values to string equivalents
+                if self.aggressiveness <= 2:
+                    self.aggressiveness = "Low"
+                elif self.aggressiveness <= 4:
+                    self.aggressiveness = "Medium"
+                elif self.aggressiveness <= 6:
+                    self.aggressiveness = "High"
+                else:
+                    self.aggressiveness = "Very High"
             else:
-                self.aggressiveness = "Auto"
+                # Handle string values
+                ag = str(self.aggressiveness or "Auto").strip()
+                ag_norm = ag.lower()
+                # Map various string formats to standard values
+                if ag_norm in ("auto", "automatic"):
+                    self.aggressiveness = "Auto"
+                elif ag_norm in ("low", "1", "2", "3"):
+                    self.aggressiveness = "Low"
+                elif ag_norm in ("medium", "med", "4", "5"):
+                    self.aggressiveness = "Medium"
+                elif ag_norm in ("high", "6", "7"):
+                    self.aggressiveness = "High"
+                elif ag_norm in ("very-high", "very high", "veryhigh", "8", "9", "10"):
+                    self.aggressiveness = "Very High"
+                else:
+                    self.aggressiveness = "Auto"
 
             # scannerRisk: coerce & clamp
             try:
@@ -800,6 +834,9 @@ async def _process_refinement_pass(
             }
         
         # Emit pass complete event
+        # Get original file path and extension for format preservation
+        original_file_path = file_path
+        original_ext = os.path.splitext(file_path)[1] if file_path else None
         pc_evt = {
             'type': 'pass_complete', 
             'jobId': job_id, 
@@ -810,7 +847,9 @@ async def _process_refinement_pass(
             'outputChars': len(ft),
             'outputPath': rr.local_path if hasattr(rr, 'local_path') and rr.local_path else None,
             'cost': pass_cost_info,
-            'textContent': ft  # CRITICAL: Include textContent for diff viewer and downloads
+            'textContent': ft,  # CRITICAL: Include textContent for diff viewer and downloads
+            'originalFilePath': original_file_path,  # Store original file path for style extraction
+            'originalExtension': original_ext  # Store original extension for format preservation
         }
         try:
             await ws_manager.broadcast(job_id, pc_evt)  # type: ignore
@@ -977,6 +1016,11 @@ async def _refine_stream(request: RefinementRequest, job_id: str) -> AsyncGenera
             # Track the current text for each pass (starts with original)
             current_text = original_text
             file_processed_successfully = False
+            
+            # CRITICAL FIX: Store the original file path and extension at the start of file processing
+            # This ensures we preserve the original format across all passes
+            original_file_path_for_format = file_path if 'file_path' in locals() else None
+            original_ext_for_format = os.path.splitext(original_file_path_for_format)[1] if original_file_path_for_format else None
             
             # Use startPass to determine the range (Resume scenario)
             start_pass = request.startPass
@@ -1279,6 +1323,8 @@ async def _refine_stream(request: RefinementRequest, job_id: str) -> AsyncGenera
                             'requestCount': len(pipeline._pass_costs)
                         }
                     
+                    # Use the stored original file path and extension (set at start of file processing)
+                    # This ensures we always use the true original file, not the current pass's input
                     pc_evt = {
                         'type': 'pass_complete', 
                         'jobId': job_id, 
@@ -1290,7 +1336,9 @@ async def _refine_stream(request: RefinementRequest, job_id: str) -> AsyncGenera
                         'outputChars': len(ft),
                         'outputPath': rr.local_path if hasattr(rr, 'local_path') and rr.local_path else None,
                         'cost': pass_cost_info,
-                        'textContent': ft
+                        'textContent': ft,
+                        'originalFilePath': original_file_path_for_format,  # Store original file path for style extraction
+                        'originalExtension': original_ext_for_format  # Store original extension for format preservation
                     }
                     logger.debug(f"About to yield pass_complete event for pass {pass_num}")
                     try:
