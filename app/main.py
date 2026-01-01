@@ -1227,8 +1227,13 @@ async def download_file(request: FileDownloadRequest):
     try:
         text_content = read_text_from_file(temp_path)
         if request.output_format == "original":
+            # Use context manager to ensure file handle is properly closed
+            def original_stream():
+                with open(temp_path, 'rb') as f:
+                    yield from f
+            
             return StreamingResponse(
-                open(temp_path, 'rb'),
+                original_stream(),
                 media_type=file_info["mime_type"],
                 headers={"Content-Disposition": f"attachment; filename={file_info['filename']}"}
             )
@@ -1240,20 +1245,48 @@ async def download_file(request: FileDownloadRequest):
                 headers={"Content-Disposition": f"attachment; filename={Path(file_info['filename']).stem}.{request.output_format}"}
             )
         elif request.output_format == "docx":
-            temp_docx = tempfile.NamedTemporaryFile(delete=False, suffix='.docx'); temp_docx.close()
-            output_path = write_text_to_file(
-                output_dir=os.path.dirname(temp_docx.name),
-                base_name=Path(file_info['filename']).stem,
-                ext=".docx",
-                text=text_content,
-                original_file=temp_path,
-                iteration=1
-            )
-            return StreamingResponse(
-                open(output_path, 'rb'),
-                media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                headers={"Content-Disposition": f"attachment; filename={Path(file_info['filename']).stem}.docx"}
-            )
+            temp_docx = None
+            output_path = None
+            try:
+                temp_docx = tempfile.NamedTemporaryFile(delete=False, suffix='.docx')
+                temp_docx.close()
+                output_path = write_text_to_file(
+                    output_dir=os.path.dirname(temp_docx.name),
+                    base_name=Path(file_info['filename']).stem,
+                    ext=".docx",
+                    text=text_content,
+                    original_file=temp_path,
+                    iteration=1
+                )
+                
+                # Use context manager to ensure file handle is properly closed
+                def docx_stream():
+                    with open(output_path, 'rb') as f:
+                        yield from f
+                    # Clean up temp file after streaming
+                    try:
+                        if temp_docx and os.path.exists(temp_docx.name):
+                            os.unlink(temp_docx.name)
+                        if output_path and os.path.exists(output_path) and output_path != temp_docx.name:
+                            os.unlink(output_path)
+                    except Exception:
+                        pass
+                
+                return StreamingResponse(
+                    docx_stream(),
+                    media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    headers={"Content-Disposition": f"attachment; filename={Path(file_info['filename']).stem}.docx"}
+                )
+            except Exception as e:
+                # Clean up temp files on error
+                try:
+                    if temp_docx and os.path.exists(temp_docx.name):
+                        os.unlink(temp_docx.name)
+                    if output_path and os.path.exists(output_path) and output_path != temp_docx.name:
+                        os.unlink(output_path)
+                except Exception:
+                    pass
+                raise
         else:
             raise HTTPException(400, f"Unsupported output format: {request.output_format}")
     except Exception as e:
@@ -1301,70 +1334,86 @@ async def serve_file_by_name(filename: str):
             # This is a best-effort fallback for ephemeral storage
             try:
                 # Search through job snapshots for this filename
+                # Sort by timestamp (most recent first) to get the latest version
                 from app.core.state import jobs_snapshot
+                matching_jobs = []
                 for job_id, job_data in jobs_snapshot.items():
                     if isinstance(job_data, dict):
                         # Check if this job has file content for this filename
                         if job_data.get('type') == 'pass_complete' and job_data.get('outputPath'):
                             output_path = job_data.get('outputPath', '')
-                            if filename in output_path or os.path.basename(output_path) == filename:
-                                text_content = job_data.get('textContent')
-                                if text_content:
-                                    # Check file extension to determine format
-                                    file_ext = Path(filename).suffix.lower()
-                                    original_ext = job_data.get('originalExtension', file_ext)
-                                    original_file_path = job_data.get('originalFilePath')
-                                    
-                                    # If it's a DOCX file, convert text to DOCX format
-                                    if file_ext == '.docx' or original_ext == '.docx':
-                                        try:
-                                            from app.utils.utils import write_text_to_file
-                                            import tempfile
-                                            # Create temporary DOCX file
-                                            with tempfile.NamedTemporaryFile(delete=False, suffix='.docx') as tmp:
-                                                temp_docx_path = tmp.name
-                                            
-                                            # Write text to DOCX using original file for style extraction
-                                            docx_path = write_text_to_file(
-                                                text=text_content,
-                                                output_dir=os.path.dirname(temp_docx_path),
-                                                base_name=Path(filename).stem,
-                                                ext='.docx',
-                                                original_file=original_file_path if original_file_path and os.path.exists(original_file_path) else None,
-                                                iteration=1
-                                            )
-                                            
-                                            # Read the DOCX file and return it
-                                            with open(docx_path, 'rb') as f:
-                                                docx_content = f.read()
-                                            
-                                            # Clean up temp file
-                                            try:
-                                                os.unlink(docx_path)
-                                            except Exception:
-                                                pass
-                                            
-                                            return StreamingResponse(
-                                                io.BytesIO(docx_content),
-                                                media_type='application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-                                                headers={
-                                                    "Content-Disposition": f'attachment; filename="{filename}"',
-                                                    "Cache-Control": "no-cache, no-store, must-revalidate",
-                                                }
-                                            )
-                                        except Exception as e:
-                                            logger.warning(f"Failed to convert text to DOCX for {filename}: {e}, falling back to plain text")
-                                            # Fall through to plain text response
-                                    
-                                    # Return text content as plain text for other formats
-                                    return StreamingResponse(
-                                        io.BytesIO(text_content.encode('utf-8')),
-                                        media_type='text/plain; charset=utf-8',
-                                        headers={
-                                            "Content-Disposition": f'attachment; filename="{filename}"',
-                                            "Cache-Control": "no-cache, no-store, must-revalidate",
-                                        }
-                                    )
+                            # Use exact filename match for better accuracy
+                            if os.path.basename(output_path) == filename or filename in output_path:
+                                timestamp = job_data.get('timestamp', job_data.get('updated_at', 0))
+                                matching_jobs.append((timestamp, job_data))
+                
+                # Sort by timestamp descending (most recent first) and take the first match
+                if matching_jobs:
+                    matching_jobs.sort(key=lambda x: x[0], reverse=True)
+                    _, job_data = matching_jobs[0]
+                    
+                    text_content = job_data.get('textContent')
+                    if text_content:
+                        # Check file extension to determine format
+                        file_ext = Path(filename).suffix.lower()
+                        original_ext = job_data.get('originalExtension', file_ext)
+                        original_file_path = job_data.get('originalFilePath')
+                        
+                        # If it's a DOCX file, convert text to DOCX format
+                        if file_ext == '.docx' or original_ext == '.docx':
+                            try:
+                                from app.utils.utils import write_text_to_file
+                                import tempfile
+                                # Create temporary DOCX file
+                                with tempfile.NamedTemporaryFile(delete=False, suffix='.docx') as tmp:
+                                    temp_docx_path = tmp.name
+                                
+                                # Write text to DOCX using original file for style extraction if available
+                                # If original file doesn't exist, still create DOCX without style extraction
+                                original_file = None
+                                if original_file_path and os.path.exists(original_file_path):
+                                    original_file = original_file_path
+                                
+                                docx_path = write_text_to_file(
+                                    text=text_content,
+                                    output_dir=os.path.dirname(temp_docx_path),
+                                    base_name=Path(filename).stem,
+                                    ext='.docx',
+                                    original_file=original_file,
+                                    iteration=1
+                                )
+                                
+                                # Read the DOCX file and return it
+                                with open(docx_path, 'rb') as f:
+                                    docx_content = f.read()
+                                
+                                # Clean up temp file
+                                try:
+                                    os.unlink(docx_path)
+                                except Exception:
+                                    pass
+                                
+                                return StreamingResponse(
+                                    io.BytesIO(docx_content),
+                                    media_type='application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+                                    headers={
+                                        "Content-Disposition": f'attachment; filename="{filename}"',
+                                        "Cache-Control": "no-cache, no-store, must-revalidate",
+                                    }
+                                )
+                            except Exception as e:
+                                logger.warning(f"Failed to convert text to DOCX for {filename}: {e}, falling back to plain text")
+                                # Fall through to plain text response
+                        
+                        # Return text content as plain text for other formats
+                        return StreamingResponse(
+                            io.BytesIO(text_content.encode('utf-8')),
+                            media_type='text/plain; charset=utf-8',
+                            headers={
+                                "Content-Disposition": f'attachment; filename="{filename}"',
+                                "Cache-Control": "no-cache, no-store, must-revalidate",
+                            }
+                        )
             except Exception:
                 # If fallback fails, continue to raise the original error
                 pass
@@ -1388,8 +1437,13 @@ async def serve_file_by_name(filename: str):
     content_type = content_type_map.get(ext, 'application/octet-stream')
     
     # Return file as streaming response
+    # Use context manager to ensure file handle is properly closed
+    def file_stream():
+        with open(resolved_path, 'rb') as f:
+            yield from f
+    
     return StreamingResponse(
-        open(resolved_path, 'rb'),
+        file_stream(),
         media_type=content_type,
         headers={
             "Content-Disposition": f'attachment; filename="{filename}"',
@@ -1778,6 +1832,16 @@ async def chat(request: ChatRequest):
     if hasattr(request, 'user_id') and request.user_id and len(request.user_id) > 100:
         return JSONResponse({"error": "user_id too long"}, status_code=400)
     
+    # Validate user_id is present and valid before MongoDB operations
+    user_id = getattr(request, 'user_id', None)
+    if not user_id or not isinstance(user_id, str) or len(user_id.strip()) == 0:
+        user_id = "default"  # Provide default user_id
+        logger.warning("Chat request missing user_id, using default")
+    
+    # Ensure user_id is valid format (alphanumeric, underscores, hyphens)
+    if not user_id.replace("_", "").replace("-", "").isalnum():
+        return JSONResponse({"error": "Invalid user_id format"}, status_code=400)
+    
     settings = get_settings()
     api_key = settings.openai_api_key
     if not api_key:
@@ -1785,8 +1849,8 @@ async def chat(request: ChatRequest):
     try:
         # Load conversation history for this user
         # Try to load from MongoDB first, fallback to in-memory
-        conversation_manager.load_from_mongodb(request.user_id, mongodb_db)
-        conversation_history = conversation_manager.get_messages(request.user_id)
+        conversation_manager.load_from_mongodb(user_id, mongodb_db)
+        conversation_history = conversation_manager.get_messages(user_id)
         
         # Create refiner with conversation history
         refiner = ConversationalRefiner(api_key, conversation_history=conversation_history)
@@ -1803,8 +1867,8 @@ async def chat(request: ChatRequest):
         
         memory_context = {}
         if request.use_memory:
-            memory_context = memory_manager.get_memory_context(request.user_id)
-            memory = memory_manager.get_memory(request.user_id)
+            memory_context = memory_manager.get_memory_context(user_id)
+            memory = memory_manager.get_memory(user_id)
             if memory.history:
                 recent_passes = memory.history[-3:]
                 context_hint = f"\n\nMemory Context: User has {len(memory.history)} previous refinement passes. Recent scores: {[p.get('score', 'N/A') for p in recent_passes]}"
@@ -1822,14 +1886,16 @@ async def chat(request: ChatRequest):
         updated_messages = refiner.get_messages()
         
         # Update conversation manager with new messages
-        # Clear and rebuild to ensure consistency
-        conversation_manager.clear_conversation(request.user_id)
-        for msg in updated_messages:
-            conversation_manager.add_message(request.user_id, msg["role"], msg["content"])
+        # Replace messages atomically to avoid race condition
+        # Get the conversation and replace messages in one operation
+        conversation = conversation_manager.get_conversation(user_id)
+        # Replace messages list atomically (this avoids race condition from clear-then-rebuild)
+        conversation.messages = [msg.copy() for msg in updated_messages]
+        conversation.updated_at = time.time()
         
         # Try to save to MongoDB (non-blocking, fails gracefully)
         try:
-            conversation_manager.save_to_mongodb(request.user_id, mongodb_db)
+            conversation_manager.save_to_mongodb(user_id, mongodb_db)
         except Exception as e:
             # Log but don't fail the request if MongoDB save fails
             logger.warning(f"Failed to save conversation to MongoDB: {e}")
