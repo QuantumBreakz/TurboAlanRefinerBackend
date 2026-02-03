@@ -377,6 +377,8 @@ class RefinementRequest(BaseModel):
             # Never fail constructor; rely on endpoint logic to handle deeper errors
             pass
 
+# TODO: DUPLICATE CODE - Consolidate with main.py version into app/services/file_service.py
+# See NAMING_ISSUES_REPORT.md Issue #3 for details
 async def _validate_and_resolve_file_path(file_info: Dict[str, Any], file_id: str) -> str:
     """Validate and resolve file path with security checks"""
     from app.utils.utils import extract_drive_file_id, download_drive_file, get_google_credentials
@@ -387,8 +389,16 @@ async def _validate_and_resolve_file_path(file_info: Dict[str, Any], file_id: st
     drive_id = file_info.get("driveId") or file_info.get("drive_id")
     source = file_info.get("source") or file_info.get("path") or ""
     
+    # FIXED: Only treat as Drive file if explicitly marked as "drive" OR source contains Drive URL
+    # Don't trust drive_id alone as it might be a local file_id
+    is_drive_file = (
+        file_type == "drive" or 
+        "drive.google.com" in source or 
+        "docs.google.com" in source
+    )
+    
     # If it's a drive file, download it first
-    if file_type == "drive" or drive_id or ("drive.google.com" in source or "docs.google.com" in source):
+    if is_drive_file:
         try:
             # Extract file ID from source if drive_id not provided
             if not drive_id and source:
@@ -438,29 +448,31 @@ async def _validate_and_resolve_file_path(file_info: Dict[str, Any], file_id: st
             logger.debug(f"Downloading Google Drive file {drive_id} ({mime_type}) to {temp_path}")
             downloaded_path = download_drive_file(drive_id, temp_path)
             
-            # Store in uploaded_files registry for future reference
-            uploaded_files[file_id] = {
+            # Store in uploaded_files registry for future reference (thread-safe)
+            from app.core.state import safe_uploaded_files_set
+            safe_uploaded_files_set(file_id, {
                 "id": file_id,
                 "name": file_name,
                 "temp_path": downloaded_path,
                 "type": "drive",
                 "drive_id": drive_id,
-                "created_at": time.time()
-            }
+                "uploaded_at": time.time()
+            })
             
             return downloaded_path
         except Exception as e:
             logger.error(f"Failed to download Google Drive file: {e}")
             raise APIError(f"Failed to download Google Drive file: {str(e)}", 500, "DRIVE_DOWNLOAD_FAILED")
     
-    # Try to get file path from uploaded_files registry first
+    # Try to get file path from uploaded_files registry first (thread-safe)
     # CRITICAL FIX: Check multiple possible file_id variations for multi-file support
+    from app.core.state import safe_uploaded_files_get
     file_path = None
     stored_file_type = None  # Track the original file type
     
     # First, try the exact file_id
-    if file_id in uploaded_files:
-        file_info_stored = uploaded_files[file_id]
+    file_info_stored = safe_uploaded_files_get(file_id)
+    if file_info_stored:
         file_path = file_info_stored.get("temp_path") or file_info_stored.get("path")
         stored_file_type = file_info_stored.get("file_type")  # Preserve file type from upload
         logger.debug(f"Found file by exact file_id: {file_id}, path: {file_path}, file_type: {stored_file_type}")
@@ -477,33 +489,39 @@ async def _validate_and_resolve_file_path(file_info: Dict[str, Any], file_id: st
     if not file_path:
         backend_file_id = file_info.get("backendFileId") or file_info.get("driveId") or file_info.get("drive_id")
         if backend_file_id:
-            # First, try direct lookup - the backend_file_id might BE the key in uploaded_files
-            if backend_file_id in uploaded_files:
-                file_info_stored = uploaded_files[backend_file_id]
+            # First, try direct lookup - use thread-safe wrapper
+            file_info_stored = safe_uploaded_files_get(backend_file_id)
+            if file_info_stored:
                 file_path = file_info_stored.get("temp_path") or file_info_stored.get("path")
                 stored_file_type = file_info_stored.get("file_type")
                 logger.debug(f"Found file by backendFileId direct lookup: {backend_file_id} -> {file_path}, type: {stored_file_type}")
             else:
                 # Fallback: search through uploaded_files for matching drive_id or id
-                for stored_file_id, stored_info in uploaded_files.items():
-                    if stored_info.get("drive_id") == backend_file_id or stored_info.get("id") == backend_file_id:
-                        file_path = stored_info.get("temp_path") or stored_info.get("path")
-                        stored_file_type = stored_info.get("file_type")
-                        logger.debug(f"Found file by backendFileId search: {backend_file_id} -> {file_path}")
-                        break
+                # Use lock for iteration
+                from app.core.state import shared_state_lock
+                with shared_state_lock:
+                    for stored_file_id, stored_info in uploaded_files.items():
+                        if stored_info.get("drive_id") == backend_file_id or stored_info.get("id") == backend_file_id:
+                            file_path = stored_info.get("temp_path") or stored_info.get("path")
+                            stored_file_type = stored_info.get("file_type")
+                            logger.debug(f"Found file by backendFileId search: {backend_file_id} -> {file_path}")
+                            break
         
         # Also try matching by source/path
         if not file_path:
             source = file_info.get("source") or file_info.get("path") or ""
             if source:
-                for stored_file_id, stored_info in uploaded_files.items():
-                    stored_path = stored_info.get("temp_path") or stored_info.get("path") or ""
-                    stored_source = stored_info.get("source") or ""
-                    if source in stored_path or source in stored_source or stored_path in source:
-                        file_path = stored_path
-                        stored_file_type = stored_info.get("file_type")
-                        logger.debug(f"Found file by source/path: {source} -> {file_path}")
-                        break
+                # Use lock for iteration
+                from app.core.state import shared_state_lock
+                with shared_state_lock:
+                    for stored_file_id, stored_info in uploaded_files.items():
+                        stored_path = stored_info.get("temp_path") or stored_info.get("path") or ""
+                        stored_source = stored_info.get("source") or ""
+                        if source in stored_path or source in stored_source or stored_path in source:
+                            file_path = stored_path
+                            stored_file_type = stored_info.get("file_type")
+                            logger.debug(f"Found file by source/path: {source} -> {file_path}")
+                            break
     
     # Fallback to file_info paths - check multiple possible path fields
     if not file_path:
@@ -523,15 +541,18 @@ async def _validate_and_resolve_file_path(file_info: Dict[str, Any], file_id: st
             # Search by filename if available
             file_name = file_info.get("name", "")
             if file_name:
-                for stored_file_id, stored_info in uploaded_files.items():
-                    stored_name = stored_info.get("filename") or stored_info.get("name", "")
-                    if stored_name == file_name or file_name in stored_name:
-                        file_path = stored_info.get("temp_path") or stored_info.get("path")
-                        stored_file_type = stored_info.get("file_type")
-                        if file_path and os.path.exists(file_path):
-                            logger.info(f"Found file by name match: {file_name} -> {file_path}")
-                            break
-                        file_path = None  # Reset if found but doesn't exist
+                # Use lock for iteration
+                from app.core.state import shared_state_lock
+                with shared_state_lock:
+                    for stored_file_id, stored_info in uploaded_files.items():
+                        stored_name = stored_info.get("filename") or stored_info.get("name", "")
+                        if stored_name == file_name or file_name in stored_name:
+                            file_path = stored_info.get("temp_path") or stored_info.get("path")
+                            stored_file_type = stored_info.get("file_type")
+                            if file_path and os.path.exists(file_path):
+                                logger.info(f"Found file by name match: {file_name} -> {file_path}")
+                                break
+                            file_path = None  # Reset if found but doesn't exist
     
     # If still no path, try to construct from filename with strict security validation
     if not file_path and file_info.get("name"):
@@ -576,6 +597,8 @@ async def _validate_and_resolve_file_path(file_info: Dict[str, Any], file_id: st
     
     return file_path
 
+# TODO: DUPLICATE CODE - Consolidate with main.py version into app/services/file_service.py
+# See NAMING_ISSUES_REPORT.md Issue #3 for details
 async def _read_and_validate_file(file_path: str, file_id: str, job_id: str) -> str:
     """Read file content and validate it exists"""
     try:
@@ -632,6 +655,8 @@ async def _read_and_validate_file(file_path: str, file_id: str, job_id: str) -> 
             logger.warning(f"WebSocket broadcast failed: {e}")
         raise APIError(f'File read failed: {error_msg}', 500, "FILE_READ_ERROR")
 
+# TODO: DUPLICATE CODE - Consolidate with main.py version into app/services/file_service.py
+# See NAMING_ISSUES_REPORT.md Issue #3 for details
 async def _check_infinite_recursion_risk(current_text: str, original_text: str, pass_num: int, file_id: str, job_id: str, last_requested_pass: int = 10) -> bool:
     """Check for infinite recursion risk and return True if should stop
     
@@ -662,6 +687,8 @@ async def _check_infinite_recursion_risk(current_text: str, original_text: str, 
     
     return False
 
+# TODO: DUPLICATE CODE - Consolidate with main.py version into app/services/file_service.py
+# See NAMING_ISSUES_REPORT.md Issue #3 for details
 async def _process_refinement_pass(
     pipeline, 
     file_path: str, 
@@ -858,7 +885,38 @@ async def _process_refinement_pass(
         safe_jobs_snapshot_set(job_id, pc_evt)
         try:
             prog = min(100.0, (pass_num / max(1, request.passes)) * 100.0)
-            upsert_job(job_id, {"current_stage": "pass_complete", "progress": prog, "status": "running"})
+            # Persist core job status
+            update_payload = {
+                "current_stage": "pass_complete",
+                "progress": prog,
+                "status": "running",
+            }
+
+            # If this is the final pass for this job, persist an explicit result contract
+            # for downstream export APIs (final-pass only, per job_id).
+            if pass_num == request.passes:
+                # Normalize input/export formats from original extension
+                fmt = "txt"
+                if original_ext:
+                    ext_lower = original_ext.lower()
+                    if ext_lower == ".pdf":
+                        fmt = "pdf"
+                    elif ext_lower in (".docx", ".doc"):
+                        fmt = "docx"
+
+                job_result = {
+                    "job_id": job_id,
+                    "file_id": file_id,
+                    "final_pass": pass_num,
+                    "input_format": fmt,
+                    "original_file_path": original_file_path,
+                    "refined_text": ft,
+                    "export_format": fmt,  # defaults to input_format
+                    "output_path": rr.local_path if hasattr(rr, "local_path") else None,
+                }
+                update_payload["result"] = job_result
+
+            upsert_job(job_id, update_payload)
         except Exception:
             pass
         
@@ -945,7 +1003,7 @@ async def _refine_stream(request: RefinementRequest, job_id: str) -> AsyncGenera
         # Extract file info for the first file (assuming single file job for now or primary file)
         primary_file = request.files[0] if request.files else {}
         if mongodb_db.is_connected():
-            mongodb_db.create_job(
+            success = mongodb_db.create_job(
                 job_id=job_id,
                 file_name=primary_file.get("name", "unknown"),
                 file_id=primary_file.get("id", "unknown"),
@@ -954,8 +1012,12 @@ async def _refine_stream(request: RefinementRequest, job_id: str) -> AsyncGenera
                 model=request.model if hasattr(request, 'model') else "gpt-4",
                 metadata={"heuristics": request.heuristics}
             )
+            if success:
+                logger.info(f"Created job {job_id} in MongoDB for user {request.user_id}")
+            else:
+                logger.error(f"MongoDB create_job returned False for job {job_id}")
     except Exception as e:
-        logger.warning(f"Failed to create job in MongoDB: {e}")
+        logger.error(f"Failed to create job in MongoDB: {e}", exc_info=True)
 
     pipeline = get_pipeline()
     logger.debug(f"Pipeline initialized successfully")
@@ -1416,6 +1478,34 @@ async def _refine_stream(request: RefinementRequest, job_id: str) -> AsyncGenera
                     pass
                 jobs_snapshot[job_id] = file_complete_evt
                 yield f"{safe_encoder(file_complete_evt)}\n\n"
+                
+                # ANALYTICS FIX: Mark job as completed in MongoDB
+                try:
+                    # Calculate metrics from last pass
+                    last_pass_metrics = {}
+                    if job_id in jobs_snapshot:
+                        last_event = jobs_snapshot[job_id]
+                        if isinstance(last_event, dict) and last_event.get('type') == 'pass_complete':
+                            metrics_data = last_event.get('metrics', {})
+                            last_pass_metrics = {
+                                "changePercent": metrics_data.get("changePercent", 0),
+                                "tensionPercent": metrics_data.get("tensionPercent", 0),
+                                "processingTime": metrics_data.get("processingTime", 0),
+                                "riskReduction": metrics_data.get("riskReduction", 0)
+                            }
+                    
+                    # Update job status to completed with final metrics
+                    upsert_job(job_id, {
+                        "current_stage": "completed",
+                        "status": "completed",
+                        "progress": 100.0,
+                        "metrics": last_pass_metrics,
+                        "completed_at": datetime.now().isoformat()
+                    })
+                    logger.info(f"Job {job_id} marked as completed with metrics: {last_pass_metrics}")
+                except Exception as e:
+                    logger.warning(f"Failed to mark job as completed: {e}")
+                    pass
             
             # Increment counter for successfully processed file (only once per file)
             if file_processed_successfully:

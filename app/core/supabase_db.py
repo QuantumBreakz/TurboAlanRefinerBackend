@@ -19,12 +19,12 @@ except ImportError:
     SUPABASE_AVAILABLE = False
     Client = None
 
-# We don't use the standard logger here to avoid recursion when logging to DB
-# Instead, we use a basic print for critical errors in this module
-def _safe_log(msg: str):
-    # Only print if DEBUG is enabled to avoid noise
-    if os.getenv("DEBUG", "").lower() in ("true", "1", "yes"):
-        print(f"[SupabaseDB] {msg}")
+# Import shared logging utility
+from app.utils.db_logging import safe_db_log
+
+# Convenience wrapper for backward compatibility
+def _safe_log(msg: str, always_print: bool = False):
+    safe_db_log(msg, module="Supabase", always_print=always_print)
 
 class SupabaseDB:
     _instance = None
@@ -265,4 +265,7 @@ class SupabaseDB:
             return []
 
 # Global instance
-db = SupabaseDB()
+supabase = SupabaseDB()
+
+# Backward compatibility alias (to be deprecated)
+db = supabase

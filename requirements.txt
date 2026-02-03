@@ -37,6 +37,9 @@ bcrypt==4.2.0
 # Stripe
 stripe==11.1.0
 
+# Rate Limiting
+slowapi==0.1.9
+
 # Optional: For academic humanizer (if used)
 # nltk==3.9.1
 # spacy

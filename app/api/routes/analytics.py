@@ -10,7 +10,7 @@ import logging
 from typing import Dict, Any
 from datetime import datetime
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Query
 from fastapi.responses import JSONResponse
 
 from app.core.mongodb_db import db as mongodb_db
@@ -22,9 +22,14 @@ router = APIRouter(prefix="/analytics", tags=["analytics"])
 
 
 @router.get("/summary")
-async def get_analytics_summary() -> JSONResponse:
+async def get_analytics_summary(
+    user_id: str = Query(None, description="Filter analytics by user ID")
+) -> JSONResponse:
     """
     Get comprehensive analytics summary, including live OpenAI usage.
+    
+    Args:
+        user_id: Optional user ID to filter analytics by specific user
     
     Returns:
         JSONResponse with analytics data including:
@@ -34,7 +39,7 @@ async def get_analytics_summary() -> JSONResponse:
         - Performance metrics
     """
     try:
-        logger.debug("Analytics endpoint called")
+        logger.info(f"[ANALYTICS] Analytics endpoint called for user_id: {user_id or 'ALL'}")
         
         # Use ONLY MongoDB for analytics
         if not mongodb_db.is_connected():
@@ -44,8 +49,13 @@ async def get_analytics_summary() -> JSONResponse:
                 "schema_usage": {"total_usages": 0, "most_used_schema": None, "most_used_count": 0, "least_used_schema": None, "least_used_count": 0, "average_usage": 0.0, "schema_usage": {}, "schema_last_used": {}}
             })
         
-        # Get all jobs from MongoDB
-        jobs = mongodb_db.get_jobs(1000)  # Get last 1000 jobs from MongoDB
+        # Get jobs from MongoDB - filter by user_id if provided
+        if user_id:
+            logger.info(f"[ANALYTICS] Filtering jobs for user_id: {user_id}")
+            jobs = mongodb_db.get_jobs(1000, user_id=user_id)
+        else:
+            logger.info("[ANALYTICS] Getting jobs for all users (admin view)")
+            jobs = mongodb_db.get_jobs(1000)
         
         # Calculate basic metrics
         total_jobs = len(jobs)
@@ -114,9 +124,9 @@ async def get_analytics_summary() -> JSONResponse:
                 "action": f"Processing {'completed' if job_status == 'completed' else 'failed' if job_status == 'failed' else 'running' if job_status == 'running' else 'pending'}",
             })
         
-        # Get MongoDB analytics
-        mongodb_openai = mongodb_db.get_aggregate_analytics()
-        mongodb_last_24h = mongodb_db.get_last_24h_analytics()
+        # Get MongoDB analytics - filter by user_id if provided
+        mongodb_openai = mongodb_db.get_aggregate_analytics(user_id=user_id)
+        mongodb_last_24h = mongodb_db.get_last_24h_analytics(user_id=user_id)
         
         result: Dict[str, Any] = {
             "jobs": {
@@ -137,7 +147,7 @@ async def get_analytics_summary() -> JSONResponse:
                 **mongodb_openai,
                 "last_24h": mongodb_last_24h
             },
-            "schema_usage": mongodb_db.get_schema_usage_stats() if mongodb_db.is_connected() else {
+            "schema_usage": mongodb_db.get_schema_usage_stats(user_id=user_id) if mongodb_db.is_connected() else {
                 "total_usages": 0,
                 "most_used_schema": None,
                 "most_used_count": 0,
@@ -149,7 +159,12 @@ async def get_analytics_summary() -> JSONResponse:
             }
         }
         
-        logger.debug(f"Returning analytics: requests={result['openai']['total_requests']}, cost=${result['openai']['total_cost']:.6f}")
+        logger.info(f"[ANALYTICS] Returning analytics for user {user_id or 'ALL'}: {total_jobs} jobs ({len(completed_jobs)} completed, {len(failed_jobs)} failed, {len(running_jobs)} running)")
+        
+        # Safe logging with get() to avoid KeyError
+        openai_requests = result.get('openai', {}).get('total_requests', 0)
+        openai_cost = result.get('openai', {}).get('total_cost', 0.0)
+        logger.debug(f"Returning analytics: requests={openai_requests}, cost=${openai_cost:.6f}")
         return JSONResponse(result)
         
     except Exception as e:

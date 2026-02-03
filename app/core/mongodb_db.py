@@ -35,12 +35,12 @@ except ImportError:
 if TYPE_CHECKING:
     from pymongo import MongoClient
 
-# We don't use the standard logger here to avoid recursion when logging to DB
-# Instead, we use a basic print for critical errors in this module
+# Import shared logging utility
+from app.utils.db_logging import safe_db_log
+
+# Convenience wrapper for backward compatibility
 def _safe_log(msg: str, always_print: bool = False):
-    # Print if DEBUG is enabled or if always_print is True
-    if always_print or os.getenv("DEBUG", "").lower() in ("true", "1", "yes"):
-        print(f"[MongoDB] {msg}")
+    safe_db_log(msg, module="MongoDB", always_print=always_print)
 
 class MongoDB:
     """
@@ -632,6 +632,10 @@ class MongoDB:
         except Exception as e:
             _safe_log(f"Failed to get job {job_id}: {e}")
             return None
+    
+    def get_job(self, job_id: str) -> Optional[Dict]:
+        """Alias for get_job_by_id() for consistency with database.py interface."""
+        return self.get_job_by_id(job_id)
 
     def get_jobs(self, limit: int = 100, user_id: Optional[str] = None) -> List[Dict]:
         """Get list of jobs."""
@@ -789,7 +793,493 @@ class MongoDB:
         except Exception as e:
             _safe_log(f"Failed to update user password: {e}")
             return False
+    
+    # --- Job Cleanup Methods ---
+    
+    def delete_job(self, job_id: str) -> bool:
+        """Delete a job by ID from MongoDB."""
+        if self._db is None:
+            return False
+        try:
+            collection = self._db.jobs
+            result = collection.delete_one({"id": job_id})
+            
+            # Also delete related job events
+            if result.deleted_count > 0:
+                self._db.job_events.delete_many({"job_id": job_id})
+                _safe_log(f"Deleted job {job_id} and its events")
+                return True
+            return False
+        except Exception as e:
+            _safe_log(f"Failed to delete job {job_id}: {e}")
+            return False
+    
+    def cleanup_old_jobs(self, days_to_keep: int = 30) -> int:
+        """
+        Clean up old completed/failed jobs from MongoDB.
+        Returns the number of jobs deleted.
+        """
+        if self._db is None:
+            return 0
+        try:
+            from datetime import datetime, timedelta
+            
+            collection = self._db.jobs
+            cutoff_date = datetime.utcnow() - timedelta(days=days_to_keep)
+            
+            # Delete old completed or failed jobs
+            result = collection.delete_many({
+                "status": {"$in": ["completed", "failed", "cancelled"]},
+                "created_at": {"$lt": cutoff_date}
+            })
+            
+            deleted_count = result.deleted_count
+            
+            # Also clean up orphaned job events
+            if deleted_count > 0:
+                # Get all remaining job IDs
+                remaining_job_ids = [
+                    doc["id"] for doc in collection.find({}, {"id": 1})
+                ]
+                
+                # Delete events for non-existent jobs
+                self._db.job_events.delete_many({
+                    "job_id": {"$nin": remaining_job_ids}
+                })
+            
+            _safe_log(f"Cleaned up {deleted_count} old jobs (older than {days_to_keep} days)")
+            return deleted_count
+        except Exception as e:
+            _safe_log(f"Failed to cleanup old jobs: {e}")
+            return 0
+    
+    # --- Chat Sessions Methods ---
+    
+    def create_chat_session(self, user_id: str, title: str = None, workspace_id: str = None) -> Optional[str]:
+        """Create a new chat session for a user."""
+        if self._db is None:
+            return None
+        try:
+            import uuid
+            session_id = str(uuid.uuid4())
+            
+            # Get current session count for auto-numbering
+            session_count = self._db.chat_sessions.count_documents({"user_id": user_id})
+            
+            session = {
+                "id": session_id,
+                "user_id": user_id,
+                "title": title or f"Chat {session_count + 1}",
+                "workspace_id": workspace_id,
+                "created_at": datetime.utcnow(),
+                "updated_at": datetime.utcnow(),
+                "message_count": 0,
+                "metadata": {},
+                # COLLABORATIVE FEATURES
+                "is_shared": False,
+                "participants": [user_id],  # Owner is always first participant
+                "participant_details": []
+            }
+            
+            self._db.chat_sessions.insert_one(session)
+            _safe_log(f"Created chat session {session_id} for user {user_id}")
+            return session_id
+        except Exception as e:
+            _safe_log(f"Failed to create chat session: {e}")
+            return None
+    
+    def get_user_sessions(self, user_id: str, limit: int = 50) -> List[Dict[str, Any]]:
+        """Get all chat sessions for a user (owned + shared with them), sorted by updated_at descending."""
+        if self._db is None:
+            return []
+        try:
+            _safe_log(f"Fetching sessions for user_id: {user_id}")
+            # Get sessions where user is owner OR participant
+            sessions = list(self._db.chat_sessions.find({
+                "$or": [
+                    {"user_id": user_id},
+                    {"participants": user_id}
+                ]
+            }).sort("updated_at", DESCENDING).limit(limit))
+            
+            _safe_log(f"Found {len(sessions)} sessions for user {user_id} (including shared)")
+            
+            # Convert ObjectId to string for JSON serialization
+            for session in sessions:
+                if "_id" in session:
+                    session["_id"] = str(session["_id"])
+                # Ensure collaborative fields exist (backward compatibility)
+                if "is_shared" not in session:
+                    session["is_shared"] = False
+                if "participants" not in session:
+                    session["participants"] = [session["user_id"]]
+                if "participant_details" not in session:
+                    session["participant_details"] = []
+            
+            return sessions
+        except Exception as e:
+            _safe_log(f"Failed to get user sessions: {e}")
+            return []
+    
+    def get_session(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """Get a specific chat session by ID."""
+        if self._db is None:
+            return None
+        try:
+            session = self._db.chat_sessions.find_one({"id": session_id})
+            if session and "_id" in session:
+                session["_id"] = str(session["_id"])
+            return session
+        except Exception as e:
+            _safe_log(f"Failed to get session {session_id}: {e}")
+            return None
+    
+    def add_chat_message(self, session_id: str, user_id: str, role: str, content: str, 
+                        metadata: Dict[str, Any] = None) -> Optional[str]:
+        """Add a message to a chat session."""
+        if self._db is None:
+            return None
+        try:
+            import uuid
+            message_id = str(uuid.uuid4())
+            
+            message = {
+                "id": message_id,
+                "session_id": session_id,
+                "user_id": user_id,
+                "role": role,  # "user", "assistant", "system"
+                "content": content,
+                "timestamp": datetime.utcnow(),
+                "metadata": metadata or {}
+            }
+            
+            # Insert message
+            self._db.chat_messages.insert_one(message)
+            
+            # Update session timestamp and message count
+            self._db.chat_sessions.update_one(
+                {"id": session_id},
+                {
+                    "$set": {"updated_at": datetime.utcnow()},
+                    "$inc": {"message_count": 1}
+                }
+            )
+            
+            # Update first/last message preview in metadata
+            if role == "user":
+                self._db.chat_sessions.update_one(
+                    {"id": session_id},
+                    {"$set": {
+                        "metadata.last_message_preview": content[:100] if len(content) > 100 else content
+                    }}
+                )
+                
+                # Set first message preview if this is the first user message
+                session = self._db.chat_sessions.find_one({"id": session_id})
+                if session and not session.get("metadata", {}).get("first_message_preview"):
+                    self._db.chat_sessions.update_one(
+                        {"id": session_id},
+                        {"$set": {
+                            "metadata.first_message_preview": content[:100] if len(content) > 100 else content
+                        }}
+                    )
+            
+            return message_id
+        except Exception as e:
+            _safe_log(f"Failed to add chat message: {e}")
+            return None
+    
+    def get_session_messages(self, session_id: str, limit: int = 100) -> List[Dict[str, Any]]:
+        """Get all messages in a chat session, sorted by timestamp ascending."""
+        if self._db is None:
+            return []
+        try:
+            messages = list(self._db.chat_messages.find(
+                {"session_id": session_id}
+            ).sort("timestamp", ASCENDING).limit(limit))
+            
+            # Convert ObjectId to string
+            for message in messages:
+                if "_id" in message:
+                    message["_id"] = str(message["_id"])
+            
+            return messages
+        except Exception as e:
+            _safe_log(f"Failed to get session messages: {e}")
+            return []
+    
+    def delete_session(self, session_id: str, user_id: str) -> bool:
+        """Delete a chat session and all its messages. Verifies ownership."""
+        if self._db is None:
+            return False
+        try:
+            # Verify ownership
+            session = self._db.chat_sessions.find_one({"id": session_id, "user_id": user_id})
+            if not session:
+                _safe_log(f"Session {session_id} not found or not owned by user {user_id}")
+                return False
+            
+            # Delete all messages in the session
+            self._db.chat_messages.delete_many({"session_id": session_id})
+            
+            # Delete the session
+            result = self._db.chat_sessions.delete_one({"id": session_id})
+            
+            success = result.deleted_count > 0
+            if success:
+                _safe_log(f"Deleted session {session_id} and its messages")
+            return success
+        except Exception as e:
+            _safe_log(f"Failed to delete session {session_id}: {e}")
+            return False
+    
+    def rename_session(self, session_id: str, user_id: str, new_title: str) -> bool:
+        """Rename a chat session. Verifies ownership."""
+        if self._db is None:
+            return False
+        try:
+            result = self._db.chat_sessions.update_one(
+                {"id": session_id, "user_id": user_id},
+                {"$set": {"title": new_title, "updated_at": datetime.utcnow()}}
+            )
+            return result.modified_count > 0
+        except Exception as e:
+            _safe_log(f"Failed to rename session {session_id}: {e}")
+            return False
+    
+    def clear_session_messages(self, session_id: str, user_id: str) -> bool:
+        """Clear all messages in a session while keeping the session. Verifies ownership."""
+        if self._db is None:
+            return False
+        try:
+            # Verify ownership
+            session = self._db.chat_sessions.find_one({"id": session_id, "user_id": user_id})
+            if not session:
+                return False
+            
+            # Delete all messages
+            self._db.chat_messages.delete_many({"session_id": session_id})
+            
+            # Reset message count and clear previews
+            self._db.chat_sessions.update_one(
+                {"id": session_id},
+                {
+                    "$set": {
+                        "message_count": 0,
+                        "updated_at": datetime.utcnow(),
+                        "metadata.first_message_preview": None,
+                        "metadata.last_message_preview": None
+                    }
+                }
+            )
+            
+            return True
+        except Exception as e:
+            _safe_log(f"Failed to clear session messages: {e}")
+            return False
+    
+    # --- Collaborative Session Methods ---
+    
+    def share_session(self, session_id: str, owner_id: str) -> bool:
+        """Enable sharing for a session (create/link workspace)."""
+        if self._db is None:
+            return False
+        try:
+            # Get session to verify ownership
+            session = self._db.chat_sessions.find_one({"id": session_id})
+            if not session or session.get("user_id") != owner_id:
+                _safe_log(f"Cannot share session {session_id}: not owned by {owner_id}")
+                return False
+            
+            # Create workspace_id if doesn't exist
+            workspace_id = session.get("workspace_id") or f"ws_{session_id}"
+            
+            # Ensure owner is in participants list
+            participants = session.get("participants", [])
+            if owner_id not in participants:
+                participants = [owner_id] + participants  # Owner first
+            
+            # Ensure participant_details includes owner
+            participant_details = session.get("participant_details", [])
+            if not any(p.get("user_id") == owner_id for p in participant_details):
+                participant_details.insert(0, {
+                    "user_id": owner_id,
+                    "email": "owner",
+                    "name": "Owner",
+                    "is_owner": True,
+                    "joined_at": session.get("created_at", datetime.utcnow())
+                })
+            
+            self._db.chat_sessions.update_one(
+                {"id": session_id},
+                {
+                    "$set": {
+                        "is_shared": True,
+                        "workspace_id": workspace_id,
+                        "participants": participants,
+                        "participant_details": participant_details,
+                        "updated_at": datetime.utcnow()
+                    }
+                }
+            )
+            
+            _safe_log(f"Enabled sharing for session {session_id} with workspace {workspace_id}, owner in participants")
+            return True
+        except Exception as e:
+            _safe_log(f"Failed to share session: {e}")
+            return False
+    
+    def unshare_session(self, session_id: str, owner_id: str) -> bool:
+        """Disable sharing for a session (make private)."""
+        if self._db is None:
+            return False
+        try:
+            # Verify ownership
+            session = self._db.chat_sessions.find_one({"id": session_id})
+            if not session or session.get("user_id") != owner_id:
+                return False
+            
+            # Keep owner in participants, remove others
+            self._db.chat_sessions.update_one(
+                {"id": session_id},
+                {
+                    "$set": {
+                        "is_shared": False,
+                        "participants": [owner_id],
+                        "participant_details": [],
+                        "updated_at": datetime.utcnow()
+                    }
+                }
+            )
+            
+            _safe_log(f"Disabled sharing for session {session_id}")
+            return True
+        except Exception as e:
+            _safe_log(f"Failed to unshare session: {e}")
+            return False
+    
+    def add_session_participant(self, session_id: str, user_id: str, user_email: str = None, user_name: str = None) -> bool:
+        """Add a participant to a shared session."""
+        if self._db is None:
+            return False
+        try:
+            # Verify session exists
+            session = self._db.chat_sessions.find_one({"id": session_id})
+            if not session:
+                _safe_log(f"Session {session_id} not found")
+                return False
+            
+            # Add to participants array
+            participants = session.get("participants", [])
+            if user_id in participants:
+                _safe_log(f"User {user_id} already participant in session {session_id}")
+                return True
+            
+            participants.append(user_id)
+            
+            # Add participant details
+            participant_details = session.get("participant_details", [])
+            participant_details.append({
+                "user_id": user_id,
+                "email": user_email or "unknown",
+                "name": user_name or user_email or user_id,
+                "joined_at": datetime.utcnow()
+            })
+            
+            self._db.chat_sessions.update_one(
+                {"id": session_id},
+                {
+                    "$set": {
+                        "participants": participants,
+                        "participant_details": participant_details,
+                        "is_shared": True,
+                        "updated_at": datetime.utcnow()
+                    }
+                }
+            )
+            
+            _safe_log(f"Added user {user_id} to session {session_id}")
+            return True
+        except Exception as e:
+            _safe_log(f"Failed to add participant: {e}")
+            return False
+    
+    def remove_session_participant(self, session_id: str, user_id: str, requester_id: str) -> bool:
+        """Remove a participant from a session (owner only)."""
+        if self._db is None:
+            return False
+        try:
+            # Verify requester is owner
+            session = self._db.chat_sessions.find_one({"id": session_id})
+            if not session or session.get("user_id") != requester_id:
+                _safe_log(f"Cannot remove participant: {requester_id} is not owner")
+                return False
+            
+            # Cannot remove owner
+            if user_id == session.get("user_id"):
+                _safe_log(f"Cannot remove owner from session")
+                return False
+            
+            # Remove from participants
+            participants = [p for p in session.get("participants", []) if p != user_id]
+            participant_details = [
+                p for p in session.get("participant_details", []) 
+                if p.get("user_id") != user_id
+            ]
+            
+            self._db.chat_sessions.update_one(
+                {"id": session_id},
+                {
+                    "$set": {
+                        "participants": participants,
+                        "participant_details": participant_details,
+                        "updated_at": datetime.utcnow()
+                    }
+                }
+            )
+            
+            _safe_log(f"Removed user {user_id} from session {session_id}")
+            return True
+        except Exception as e:
+            _safe_log(f"Failed to remove participant: {e}")
+            return False
+    
+    def get_session_participants(self, session_id: str) -> List[Dict[str, Any]]:
+        """Get all participants in a session."""
+        if self._db is None:
+            return []
+        try:
+            session = self._db.chat_sessions.find_one({"id": session_id})
+            
+            if not session:
+                return []
+            
+            participants = session.get("participant_details", [])
+            
+            # Add owner info if not in details
+            owner_id = session.get("user_id")
+            if owner_id and not any(p.get("user_id") == owner_id for p in participants):
+                participants.insert(0, {
+                    "user_id": owner_id,
+                    "email": "owner",
+                    "name": "Owner",
+                    "joined_at": session.get("created_at"),
+                    "is_owner": True
+                })
+            else:
+                # Mark owner in existing participants
+                for p in participants:
+                    if p.get("user_id") == owner_id:
+                        p["is_owner"] = True
+            
+            return participants
+        except Exception as e:
+            _safe_log(f"Failed to get session participants: {e}")
+            return []
 
 # Global instance
-db = MongoDB()
+mongodb = MongoDB()
+
+# Backward compatibility alias (to be deprecated)
+db = mongodb
 

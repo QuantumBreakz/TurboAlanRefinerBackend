@@ -59,6 +59,7 @@ from app.utils.utils import (
     get_google_credentials,
     create_google_doc,
     make_style_skeleton_from_docx,
+    safe_encoder,
     write_docx_with_skeleton,
     make_style_sequence_from_docx
 )
@@ -101,18 +102,7 @@ def validate_file_content(content: bytes, file_type: str) -> bool:
     
     return False
 
-def safe_encoder(obj):
-    """Safely encode JSON for SSE, ensuring no newlines or special chars break the format"""
-    json_str = json.dumps(obj, ensure_ascii=True, separators=(',', ':'))
-    # Replace any remaining newlines or carriage returns
-    json_str = json_str.replace('\n', '\\n').replace('\r', '\\r')
-    
-    # Debug: Log if the original JSON contained problematic characters
-    original_json = json.dumps(obj, ensure_ascii=True, separators=(',', ':'))
-    if '\n' in original_json or '\r' in original_json:
-        print(f"DEBUG: Original JSON contained problematic chars: {repr(original_json)}")
-    
-    return json_str
+# safe_encoder now imported from app.utils.utils (removed duplicate)
 
 def validate_style_skeleton(skel: Dict[str, Any]) -> Dict[str, Any]:
     """Comprehensive style skeleton validation with security checks."""
@@ -371,6 +361,51 @@ async def lifespan(app: FastAPI):
         if os.getenv("VERCEL") or os.getenv("PRODUCTION"):
             raise
     
+    # Startup: validate environment variables first
+    logger.info("Validating environment variables...")
+    
+    # Required variables
+    required_vars = {
+        "OPENAI_API_KEY": "Required for AI processing",
+    }
+    
+    # Optional but recommended
+    optional_vars = {
+        "MONGO_URI": "Required for data persistence (also accepts MONGODB_URL or MONGO_URL)",
+        "GOOGLE_SERVICE_ACCOUNT_JSON": "Required for Google Drive/Docs export",
+    }
+    
+    # Check required
+    missing_required = []
+    for var, description in required_vars.items():
+        if not os.getenv(var):
+            missing_required.append(f"  - {var}: {description}")
+    
+    if missing_required:
+        error_msg = "Missing required environment variables:\n" + "\n".join(missing_required)
+        logger.error(error_msg)
+        print(f"\n❌ STARTUP ERROR:\n{error_msg}\n")
+        import sys
+        sys.exit(1)
+    
+    # Check optional
+    missing_optional = []
+    for var, description in optional_vars.items():
+        # For MONGO_URI, check all MongoDB variable variants
+        if var == "MONGO_URI":
+            if not (os.getenv("MONGO_URI") or os.getenv("MONGODB_URL") or os.getenv("MONGO_URL")):
+                missing_optional.append(f"  - {var}: {description}")
+        elif not os.getenv(var):
+            missing_optional.append(f"  - {var}: {description}")
+    
+    if missing_optional:
+        warning_msg = "Optional environment variables not set:\n" + "\n".join(missing_optional)
+        logger.warning(warning_msg)
+        print(f"\n⚠️  WARNING:\n{warning_msg}")
+        print("Some features may not be available.\n")
+    
+    logger.info("Environment validation complete ✓")
+    
     # Startup: eager init pipeline to avoid lazy-load lock hang
     logger.info("Initializing pipeline at startup...")
     try:
@@ -412,6 +447,8 @@ from app.api.routes.schema import router as schema_router
 from app.api.routes.stripe import router as stripe_router
 from app.api.routes.payments import router as payments_router
 from app.api.routes.stripe_prices import router as stripe_prices_router
+from app.api.routes.workspace_routes import router as workspace_router
+from app.api.routes.chat import router as chat_router
 
 app.include_router(analytics_router)
 app.include_router(jobs_router)
@@ -421,6 +458,8 @@ app.include_router(refine_router, prefix="/refine", tags=["refinement"])
 app.include_router(stripe_router)  # Stripe payment and subscription endpoints
 app.include_router(payments_router)  # Payments webhook endpoint
 app.include_router(stripe_prices_router)  # Stripe price management endpoints
+app.include_router(workspace_router)  # Workspace & collaborative chat endpoints
+app.include_router(chat_router)  # Chat sessions endpoints
 
 @app.exception_handler(RefinerException)
 async def refiner_exception_handler(request: Request, exc: RefinerException):
@@ -497,7 +536,8 @@ async def rate_limit_middleware(request, call_next):
         
         # Special handling for file uploads - stricter rate limiting
         is_file_upload = request.url.path.startswith("/files/upload")
-        upload_rate_limit = 10  # Lower limit for uploads
+        # More reasonable upload limit - 50 per minute (was 10, too restrictive)
+        upload_rate_limit = 50  # Allow reasonable uploads for development/testing
         
         # Thread-safe rate limiting
         with rate_limit_lock:
@@ -511,12 +551,22 @@ async def rate_limit_middleware(request, call_next):
             max_requests = upload_rate_limit if is_file_upload else RATE_LIMIT_MAX_REQUESTS
             
             if client_ip in rate_limit_storage:
-                if rate_limit_storage[client_ip]["count"] >= max_requests:
+                # FIXED: Check if this is a different endpoint type, reset counter
+                stored_is_upload = rate_limit_storage[client_ip].get("is_upload", False)
+                if stored_is_upload != is_file_upload:
+                    # Different endpoint type, reset counter
+                    rate_limit_storage[client_ip] = {
+                        "count": 1,
+                        "last_reset": current_time,
+                        "is_upload": is_file_upload
+                    }
+                elif rate_limit_storage[client_ip]["count"] >= max_requests:
                     return JSONResponse(
                         {"error": "Rate limit exceeded", "retry_after": RATE_LIMIT_WINDOW, "limit_type": "upload" if is_file_upload else "general"}, 
                         status_code=429
                     )
-                rate_limit_storage[client_ip]["count"] += 1
+                else:
+                    rate_limit_storage[client_ip]["count"] += 1
             else:
                 rate_limit_storage[client_ip] = {
                     "count": 1,
@@ -656,7 +706,8 @@ async def request_logger(request, call_next):
 # Enhanced Pydantic models
 # RefinementRequest moved to app.api.routes.refine
 
-class ChatRequest(BaseModel):
+class DocumentChatRequest(BaseModel):
+    """Chat request for document-specific chat (non-workspace)."""
     message: str
     flags: Dict[str, Any] = {}
     schema_levels: Dict[str, Any] = {}
@@ -744,25 +795,35 @@ async def periodic_cleanup():
 async def cleanup_memory_usage():
     """Clean up memory usage when limits are exceeded"""
     try:
+        # FIXED: Remove double lock acquisition (was causing potential deadlock)
+        # Check if we're approaching limits
+        from app.core.state import shared_state_lock, uploaded_files, safe_uploaded_files_get, safe_uploaded_files_del
+        
+        # Check uploaded files with lock
         with shared_state_lock:
-            # Check if we're approaching limits
             if len(uploaded_files) > MAX_UPLOADED_FILES * 0.8:  # 80% of limit
                 logger.warning(f"Uploaded files approaching limit: {len(uploaded_files)}/{MAX_UPLOADED_FILES}")
                 # Remove oldest files
                 sorted_files = sorted(uploaded_files.items(), key=lambda x: x[1].get("uploaded_at", 0))
                 files_to_remove = [fid for fid, _ in sorted_files[:len(uploaded_files) // 4]]  # Remove 25%
-                
-                for file_id in files_to_remove:
-                    try:
-                        file_info = uploaded_files[file_id]
-                        if os.path.exists(file_info["temp_path"]):
-                            os.unlink(file_info["temp_path"])
-                        del uploaded_files[file_id]
-                    except Exception as e:
-                        logger.warning(f"Failed to remove file {file_id}: {e}")
-                
-                logger.info(f"Emergency cleanup removed {len(files_to_remove)} files")
+            else:
+                files_to_remove = []
+        
+        # Remove files outside the lock (I/O operations)
+        if files_to_remove:
+            for file_id in files_to_remove:
+                try:
+                    file_info = safe_uploaded_files_get(file_id)
+                    if file_info and os.path.exists(file_info.get("temp_path", "")):
+                        os.unlink(file_info["temp_path"])
+                    safe_uploaded_files_del(file_id)
+                except Exception as e:
+                    logger.warning(f"Failed to remove file {file_id}: {e}")
             
+            logger.info(f"Emergency cleanup removed {len(files_to_remove)} files")
+        
+        # Check jobs_snapshot with lock
+        with shared_state_lock:
             if len(jobs_snapshot) > MAX_JOBS_SNAPSHOT * 0.8:  # 80% of limit
                 logger.warning(f"Jobs snapshot approaching limit: {len(jobs_snapshot)}/{MAX_JOBS_SNAPSHOT}")
                 # Remove oldest jobs
@@ -1186,6 +1247,7 @@ async def upload_file(file: UploadFile = File(...)) -> FileUploadResponse:
             "original_filename": original_filename,  # Keep original for reference
             "temp_path": temp_file.name,
             "size": len(content),
+            "type": "local",  # FIXED: Explicitly mark as local file, not Drive
             "file_type": file_type,
             "mime_type": mime_type,
             "uploaded_at": uploaded_at
@@ -1461,9 +1523,11 @@ async def upload_to_drive(request: Request):
     except Exception:
         return JSONResponse({"error": "invalid json"}, status_code=400)
     file_id = data.get("file_id"); folder_id = data.get("folder_id")
-    if not file_id or file_id not in uploaded_files:
+    # Use thread-safe wrapper
+    file_info = safe_uploaded_files_get(file_id)
+    if not file_info:
         return JSONResponse({"error": "File not found"}, status_code=404)
-    file_info = uploaded_files[file_id]; temp_path = file_info["temp_path"]
+    temp_path = file_info["temp_path"]
     try:
         creds = get_google_credentials()
         if not creds:
@@ -1480,11 +1544,16 @@ async def upload_to_drive(request: Request):
         log_exception("DRIVE_UPLOAD_ERROR", e)
         return JSONResponse({"error": f"Google Drive upload failed: {str(e)}"}, status_code=500)
 
+# TODO: DUPLICATE CODE - Consolidate with refine.py version into app/services/file_service.py
+# See NAMING_ISSUES_REPORT.md Issue #3 for details
 async def _validate_and_resolve_file_path(file_info: Dict[str, Any], file_id: str) -> str:
     """Validate and resolve file path with security checks"""
-    # Try to get file path from uploaded_files registry first
-    if file_id in uploaded_files:
-        file_path = uploaded_files[file_id]["temp_path"]
+    from app.core.state import safe_uploaded_files_get
+    
+    # Try to get file path from uploaded_files registry first (thread-safe)
+    file_info_stored = safe_uploaded_files_get(file_id)
+    if file_info_stored:
+        file_path = file_info_stored.get("temp_path", "")
     else:
         # Fallback to file_info paths - check multiple possible path fields
         file_path = (file_info.get("path") or 
@@ -1519,6 +1588,8 @@ async def _validate_and_resolve_file_path(file_info: Dict[str, Any], file_id: st
     
     return file_path
 
+# TODO: DUPLICATE CODE - Consolidate with refine.py version into app/services/file_service.py
+# See NAMING_ISSUES_REPORT.md Issue #3 for details
 async def _read_and_validate_file(file_path: str, file_id: str, job_id: str) -> str:
     """Read file content and validate it exists"""
     try:
@@ -1575,6 +1646,8 @@ async def _read_and_validate_file(file_path: str, file_id: str, job_id: str) -> 
             logger.warning(f"WebSocket broadcast failed: {e}")
         raise APIError(f'File read failed: {error_msg}', 500, "FILE_READ_ERROR")
 
+# TODO: DUPLICATE CODE - Consolidate with refine.py version into app/services/file_service.py
+# See NAMING_ISSUES_REPORT.md Issue #3 for details
 async def _check_infinite_recursion_risk(current_text: str, original_text: str, pass_num: int, file_id: str, job_id: str) -> bool:
     """Check for infinite recursion risk and return True if should stop"""
     if pass_num > 1:
@@ -1606,6 +1679,8 @@ async def _check_infinite_recursion_risk(current_text: str, original_text: str, 
     
     return False
 
+# TODO: DUPLICATE CODE - Consolidate with refine.py version into app/services/file_service.py
+# See NAMING_ISSUES_REPORT.md Issue #3 for details
 async def _process_refinement_pass(
     pipeline, 
     file_path: str, 
@@ -1819,7 +1894,7 @@ async def _process_refinement_pass(
         return False, current_text, {}
 
 @app.post("/chat")
-async def chat(request: ChatRequest):
+async def chat(request: DocumentChatRequest):
     # Enhanced input validation
     if not request.message or not request.message.strip():
         return JSONResponse({"error": "message is required"}, status_code=400)
@@ -2277,8 +2352,8 @@ async def download_drive_file_endpoint(file_id: str, request: DriveDownloadReque
         # Generate local file ID
         local_file_id = str(uuid.uuid4())
         
-        # Store in uploaded_files registry
-        uploaded_files[local_file_id] = {
+        # Store in uploaded_files registry using thread-safe wrapper
+        safe_uploaded_files_set(local_file_id, {
             "id": local_file_id,
             "name": file_name,
             "path": downloaded_path,
@@ -2286,7 +2361,7 @@ async def download_drive_file_endpoint(file_id: str, request: DriveDownloadReque
             "type": "drive_download",
             "drive_id": file_id,
             "created_at": time.time()
-        }
+        })
         
         return {
             "local_file_id": local_file_id,
@@ -2948,14 +3023,15 @@ async def apply_style_skeleton(request: ApplyStyleRequest):
         
         # Generate local file ID for the output
         local_file_id = str(uuid.uuid4())
-        uploaded_files[local_file_id] = {
+        # Use thread-safe wrapper
+        safe_uploaded_files_set(local_file_id, {
             "id": local_file_id,
             "name": os.path.basename(output_path),
             "path": output_path,
             "size": os.path.getsize(output_path),
             "type": "styled_output",
             "created_at": time.time()
-        }
+        })
         
         return {
             "local_file_id": local_file_id,
@@ -3363,32 +3439,34 @@ async def get_diff(request: Request):
         # FALLBACK: If versions not found, search jobs_snapshot for pass_complete events
         # Note: jobs_snapshot only stores the latest event per job_id, so we may only find one pass
         if not from_text or not to_text:
-            from app.core.state import jobs_snapshot
+            from app.core.state import jobs_snapshot, shared_state_lock
             logger.debug(f"Searching jobs_snapshot for file_id={file_id}, from_pass={from_pass}, to_pass={to_pass}")
             
-            # Search through all jobs in snapshot
-            for job_id, job_data in jobs_snapshot.items():
-                if not isinstance(job_data, dict):
-                    continue
-                
-                # Check if this is a pass_complete event for our file_id
-                if (job_data.get('type') == 'pass_complete' and 
-                    job_data.get('fileId') == file_id):
+            # FIXED: Use lock for iteration
+            with shared_state_lock:
+                # Search through all jobs in snapshot
+                for job_id, job_data in jobs_snapshot.items():
+                    if not isinstance(job_data, dict):
+                        continue
                     
-                    pass_num = job_data.get('pass')
-                    text_content = job_data.get('textContent')
-                    
-                    if pass_num == from_pass and text_content and not from_text:
-                        from_text = text_content
-                        logger.debug(f"Found from_pass {from_pass} content from jobs_snapshot for job {job_id}")
-                    
-                    if pass_num == to_pass and text_content and not to_text:
-                        to_text = text_content
-                        logger.debug(f"Found to_pass {to_pass} content from jobs_snapshot for job {job_id}")
-                    
-                    # If we found both, we can break early
-                    if from_text and to_text:
-                        break
+                    # Check if this is a pass_complete event for our file_id
+                    if (job_data.get('type') == 'pass_complete' and 
+                        job_data.get('fileId') == file_id):
+                        
+                        pass_num = job_data.get('pass')
+                        text_content = job_data.get('textContent')
+                        
+                        if pass_num == from_pass and text_content and not from_text:
+                            from_text = text_content
+                            logger.debug(f"Found from_pass {from_pass} content from jobs_snapshot for job {job_id}")
+                        
+                        if pass_num == to_pass and text_content and not to_text:
+                            to_text = text_content
+                            logger.debug(f"Found to_pass {to_pass} content from jobs_snapshot for job {job_id}")
+                        
+                        # If we found both, we can break early
+                        if from_text and to_text:
+                            break
         
         # FALLBACK 2: If still not found, try MongoDB job_events
         # This is important for historical passes since jobs_snapshot only stores the latest event
