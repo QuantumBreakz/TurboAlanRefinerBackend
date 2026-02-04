@@ -1265,7 +1265,9 @@ async def _refine_stream(request: RefinementRequest, job_id: str) -> AsyncGenera
                                 "metrics": metrics, 
                                 "success": success,
                                 "textContent": ft,  # Store textContent for diff viewer fallback
-                                "fileId": file_id
+                                "fileId": file_id,
+                                "file_path": rr.local_path,  # CRITICAL: Store file path for downloads
+                                "fileName": file_name  # Store file name for display
                             }
                         )
                         
@@ -1853,6 +1855,178 @@ async def get_preset(preset_name: str):
         "preset": preset_name,
         **profile
     })
+
+
+@router.get("/job/{job_id}/files-and-passes")
+async def get_job_files_and_passes(job_id: str):
+    """
+    Get all files and their passes for a job.
+    This is what the frontend should call (it has job_id, not file_id).
+    Returns list of files, each with their passes.
+    """
+    try:
+        # Get all pass_complete events from MongoDB to find file_ids for this job
+        all_files = {}
+        
+        if mongodb_db.is_connected():
+            events = mongodb_db._db.job_events.find({
+                "job_id": job_id,
+                "event_type": "pass_complete"
+            }).sort("pass_number", 1)
+            
+            for event in events:
+                details = event.get('details', {})
+                file_id = details.get('fileId')
+                if not file_id:
+                    continue
+                
+                if file_id not in all_files:
+                    all_files[file_id] = {
+                        "fileId": file_id,
+                        "fileName": details.get('fileName', 'unknown'),
+                        "passes": []
+                    }
+                
+                all_files[file_id]["passes"].append({
+                    "passNumber": event.get('pass_number', 0),
+                    "filePath": details.get('file_path'),
+                    "fileName": os.path.basename(details.get('file_path', '')) if details.get('file_path') else None,
+                    "fileExtension": os.path.splitext(details.get('file_path', ''))[1] if details.get('file_path') else None,
+                    "metrics": details.get('metrics', {}),
+                    "timestamp": event.get('created_at').isoformat() if event.get('created_at') else None
+                })
+        
+        # Also check file_version_manager for any missing data
+        # (in case MongoDB isn't available or data is only in memory)
+        if not all_files:
+            # Fallback: try to infer from jobs_snapshot
+            job_info = jobs_snapshot.get(job_id, {})
+            if job_info.get('fileId'):
+                file_id = job_info['fileId']
+                all_versions = file_version_manager.get_all_versions(file_id)
+                if all_versions:
+                    all_files[file_id] = {
+                        "fileId": file_id,
+                        "fileName": job_info.get('fileName', 'unknown'),
+                        "passes": []
+                    }
+                    for pass_num in sorted(all_versions.keys()):
+                        version = all_versions[pass_num]
+                        all_files[file_id]["passes"].append({
+                            "passNumber": pass_num,
+                            "filePath": version.file_path,
+                            "fileName": os.path.basename(version.file_path) if version.file_path else None,
+                            "fileExtension": os.path.splitext(version.file_path)[1] if version.file_path else None,
+                            "metrics": version.metrics or {},
+                            "timestamp": version.timestamp
+                        })
+        
+        files_list = list(all_files.values())
+        
+        return JSONResponse(content={
+            "jobId": job_id,
+            "files": files_list,
+            "totalFiles": len(files_list),
+            "totalPasses": sum(len(f["passes"]) for f in files_list)
+        })
+        
+    except Exception as e:
+        logger.error(f"Failed to get job files and passes: {e}", exc_info=True)
+        return JSONResponse(
+            status_code=500,
+            content={"error": f"Failed to get job files and passes: {str(e)}"}
+        )
+
+
+@router.get("/file/{file_id}/passes")
+async def get_file_passes(file_id: str):
+    """
+    Get all passes for a file with download links.
+    CRITICAL: Use file_id, not job_id (passes are stored per file_id).
+    Returns list of all passes with their file paths, metrics, and content.
+    """
+    try:
+        # Get all passes from file version manager using file_id
+        all_versions = file_version_manager.get_all_versions(file_id)
+        
+        if not all_versions:
+            return JSONResponse(
+                status_code=404,
+                content={"error": f"No passes found for file {file_id}"}
+            )
+        
+        # Convert versions to response format
+        passes = []
+        for pass_num in sorted(all_versions.keys()):
+            version = all_versions[pass_num]
+            passes.append({
+                "passNumber": pass_num,
+                "filePath": version.file_path,
+                "fileName": os.path.basename(version.file_path) if version.file_path else None,
+                "fileExtension": os.path.splitext(version.file_path)[1] if version.file_path else None,
+                "textContent": version.content[:500] if version.content else None,  # Preview only
+                "contentLength": len(version.content) if version.content else 0,
+                "metrics": version.metrics or {},
+                "metadata": version.metadata or {},
+                "timestamp": version.timestamp
+            })
+        
+        return JSONResponse(content={
+            "fileId": file_id,
+            "passes": passes,
+            "totalPasses": len(passes)
+        })
+        
+    except Exception as e:
+        logger.error(f"Failed to get file passes: {e}")
+        return JSONResponse(
+            status_code=500,
+            content={"error": f"Failed to get passes: {str(e)}"}
+        )
+
+
+@router.get("/file/{file_id}/pass/{pass_number}/download")
+async def download_file_pass(file_id: str, pass_number: int):
+    """
+    Download a specific pass file.
+    CRITICAL: Use file_id, not job_id (passes are stored per file_id).
+    Returns the actual file with proper content-type headers.
+    """
+    try:
+        from fastapi.responses import FileResponse
+        
+        # Get the pass from file version manager using file_id
+        version = file_version_manager.get_version(file_id, pass_number)
+        
+        if not version or not version.file_path or not os.path.exists(version.file_path):
+            return JSONResponse(
+                status_code=404,
+                content={"error": f"Pass {pass_number} not found for file {file_id}"}
+            )
+        
+        # Determine media type from extension
+        ext = os.path.splitext(version.file_path)[1]
+        media_type = {
+            '.pdf': 'application/pdf',
+            '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+            '.txt': 'text/plain',
+            '.md': 'text/markdown'
+        }.get(ext, 'application/octet-stream')
+        
+        logger.info(f"📥 Downloading pass {pass_number} for file {file_id}: {version.file_path} ({ext})")
+        
+        return FileResponse(
+            version.file_path,
+            media_type=media_type,
+            filename=os.path.basename(version.file_path)
+        )
+        
+    except Exception as e:
+        logger.error(f"Failed to download pass: {e}")
+        return JSONResponse(
+            status_code=500,
+            content={"error": f"Failed to download pass: {str(e)}"}
+        )
 
 
 @router.get("/job/{job_id}/report")

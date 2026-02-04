@@ -408,7 +408,7 @@ class RefinementPipeline:
         t0 = time.perf_counter()
         
         # CRITICAL FIX: On first pass, capture and store the original file extension (per job_id)
-        # This ensures Word docs (.docx) remain as Word docs across all passes
+        # This ensures Word docs (.docx) remain as Word docs, PDF stays PDF, etc. across all passes
         # Use job_id-keyed storage to avoid race conditions in the singleton pipeline
         effective_job_id = job_id or "default"
         if pass_index == 1:
@@ -425,10 +425,14 @@ class RefinementPipeline:
                     file_type = 'doc'
                 elif original_ext == '.pdf':
                     file_type = 'pdf'
-                elif original_ext == '.md':
+                elif original_ext == '.md' or original_ext == '.markdown':
                     file_type = 'md'
-                else:
+                elif original_ext == '.txt':
                     file_type = 'txt'
+                else:
+                    # For unknown extensions, try to preserve them
+                    file_type = 'txt'
+                    print(f"⚠️ PIPELINE: Unknown extension {original_ext}, will preserve it but treat as text")
                 
                 # Thread-safe storage of job-specific extension data and original path
                 with self._job_lock:
@@ -438,12 +442,15 @@ class RefinementPipeline:
                     # Cleanup old job data to prevent memory leaks
                     self._cleanup_old_job_data()
                 
-                print(f"PIPELINE: Captured original extension for job {effective_job_id}: {original_ext}, type: {file_type}, path: {input_path}")
+                print(f"📄 PIPELINE: Captured original format for job {effective_job_id}: {original_ext} (type: {file_type})")
+                print(f"   → Original file path: {input_path}")
+                print(f"   → ALL PASSES will output as {original_ext} format")
             else:
                 # No extension found, default to .txt
                 with self._job_lock:
                     self._job_extensions[effective_job_id] = '.txt'
                     self._job_file_types[effective_job_id] = 'txt'
+                print(f"⚠️ PIPELINE: No extension found for {input_path}, defaulting to .txt")
                 print(f"PIPELINE: No extension found for job {effective_job_id}, defaulting to .txt")
         
         if prev_final_text and pass_index > 1:
@@ -691,20 +698,26 @@ class RefinementPipeline:
         t0 = time.perf_counter()
         base, ext = os.path.splitext(os.path.basename(input_path))
         
-        # CRITICAL FIX: Use job-specific stored original extension to preserve file format across passes
-        # This ensures Word docs (.docx) remain as Word docs, not .txt files
+        # CRITICAL FIX: ALWAYS use job-specific stored original extension to preserve file format across ALL passes
+        # This ensures PDF → PDF, DOCX → DOCX, not PDF → TXT or DOCX → TXT
         # Thread-safe: uses job_id-keyed storage to avoid race conditions in singleton pipeline
         job_ext = self._get_job_extension(effective_job_id)
-        if job_ext and job_ext != '.txt':
+        job_file_type = self._get_job_file_type(effective_job_id)
+        
+        # OVERRIDE: Always use stored extension (captured on pass 1)
+        if job_ext:
             ext = job_ext
-            print(f"PIPELINE: Using stored original extension for job {effective_job_id}: {ext}")
-        elif ext and not ext.startswith('.'):
-            ext = '.' + ext
-        elif not ext:
-            ext = job_ext if job_ext else '.txt'  # Use job extension or default
+            print(f"✅ PIPELINE: Using stored original extension for job {effective_job_id}: {ext} (type: {job_file_type})")
+        else:
+            # Fallback: use current file extension
+            if ext and not ext.startswith('.'):
+                ext = '.' + ext
+            elif not ext:
+                ext = '.txt'  # Last resort default
+            print(f"⚠️ PIPELINE: No stored extension found for job {effective_job_id}, using current: {ext}")
         
         # Log the extension being used for debugging
-        print(f"PIPELINE: Writing pass {pass_index} output for job {effective_job_id} with extension: {ext}, base: {base}")
+        print(f"📝 PIPELINE: Writing pass {pass_index} output → {base}_pass{pass_index}{ext}")
         
         # CRITICAL FIX: Use stored original file path for style skeleton extraction
         # On subsequent passes, input_path might be a .txt file from previous pass

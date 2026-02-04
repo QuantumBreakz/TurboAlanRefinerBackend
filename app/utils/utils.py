@@ -790,6 +790,9 @@ def write_text_to_file(text: str = None, file_path: str = None, output_dir: str 
     # Create directory if needed
     os.makedirs(os.path.dirname(file_path) if os.path.dirname(file_path) else '.', exist_ok=True)
     
+    # CRITICAL: Log the file format being used for debugging client issues
+    print(f"📄 write_text_to_file: Writing {file_path} with ext={ext}, original_file={original_file}")
+    
     # Handle DOCX format
     if ext == '.docx' or (file_path and file_path.endswith('.docx')):
         # Use write_docx_with_skeleton for DOCX files with enhanced formatting
@@ -821,13 +824,15 @@ def write_text_to_file(text: str = None, file_path: str = None, output_dir: str 
     
     # Handle PDF format
     if ext == '.pdf' or (file_path and file_path.endswith('.pdf')):
-        # Extract skeleton for PDF formatting
+        # Extract skeleton for PDF formatting (only if original is DOCX)
         skeleton = None
         if original_file and os.path.exists(original_file):
-            try:
-                skeleton = make_style_skeleton_from_docx(original_file)
-            except Exception as e:
-                print(f"Warning: Failed to extract skeleton for PDF: {e}")
+            orig_ext = os.path.splitext(original_file)[1].lower()
+            if orig_ext == '.docx':
+                try:
+                    skeleton = make_style_skeleton_from_docx(original_file)
+                except Exception as e:
+                    print(f"Warning: Failed to extract skeleton for PDF: {e}")
         return _write_text_to_pdf(text, file_path, skeleton)
     
     # Handle Markdown - preserve it as plain text with .md extension
