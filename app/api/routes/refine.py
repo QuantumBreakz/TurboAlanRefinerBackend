@@ -446,7 +446,16 @@ async def _validate_and_resolve_file_path(file_info: Dict[str, Any], file_id: st
             
             # Download the file
             logger.debug(f"Downloading Google Drive file {drive_id} ({mime_type}) to {temp_path}")
-            downloaded_path = download_drive_file(drive_id, temp_path)
+            try:
+                downloaded_path = download_drive_file(drive_id, temp_path)
+            except Exception as e:
+                # Cleanup temp file on download failure
+                if os.path.exists(temp_path):
+                    try:
+                        os.unlink(temp_path)
+                    except Exception:
+                        pass
+                raise
             
             # Store in uploaded_files registry for future reference (thread-safe)
             from app.core.state import safe_uploaded_files_set

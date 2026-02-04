@@ -1202,26 +1202,35 @@ def write_docx_with_skeleton(text: str, output_path: str, skeleton: Dict[str, An
     
     # Save to temporary path first
     temp_path = output_path + ".temp"
-    doc.save(temp_path)
-    
-    # PHASE 3: Apply heading mapping if original file exists
-    # This uses the existing map_headings_to_refined_doc function for additional heading detection
-    if original_file and os.path.exists(original_file):
-        try:
-            # Use existing heading mapper for additional precision
-            map_headings_to_refined_doc(original_file, temp_path, output_path)
-            # Clean up temp file
-            if os.path.exists(temp_path):
-                os.remove(temp_path)
-        except Exception as e:
-            print(f"Warning: Heading mapping failed: {e}")
-            # Fallback: just rename temp to output
+    try:
+        doc.save(temp_path)
+        
+        # PHASE 3: Apply heading mapping if original file exists
+        # This uses the existing map_headings_to_refined_doc function for additional heading detection
+        if original_file and os.path.exists(original_file):
+            try:
+                # Use existing heading mapper for additional precision
+                map_headings_to_refined_doc(original_file, temp_path, output_path)
+                # Clean up temp file
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+            except Exception as e:
+                print(f"Warning: Heading mapping failed: {e}")
+                # Fallback: just rename temp to output
+                if os.path.exists(temp_path):
+                    os.rename(temp_path, output_path)
+        else:
+            # No original file, just rename temp to output
             if os.path.exists(temp_path):
                 os.rename(temp_path, output_path)
-    else:
-        # No original file, just rename temp to output
+    except Exception as e:
+        # Cleanup temp file on error
         if os.path.exists(temp_path):
-            os.rename(temp_path, output_path)
+            try:
+                os.remove(temp_path)
+            except Exception:
+                pass
+        raise
     
     return output_path
 

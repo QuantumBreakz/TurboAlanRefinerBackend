@@ -120,29 +120,40 @@ class FileVersionManager:
         return versions[latest_pass]
     
     def _persist_version(self, version: FileVersion):
-        """Persist a version to disk."""
-        file_dir = self.storage_dir / version.file_id
-        file_dir.mkdir(exist_ok=True)
-        
-        version_file = file_dir / f"pass_{version.pass_number}.json"
-        
-        # Store metadata
-        version_data = asdict(version)
-        with open(version_file, 'w', encoding='utf-8') as f:
-            json.dump(version_data, f, indent=2, ensure_ascii=False)
-        
-        # Store content separately if it's large
-        if len(version.content) > 10000:  # 10KB threshold
-            content_file = file_dir / f"pass_{version.pass_number}_content.txt"
-            with open(content_file, 'w', encoding='utf-8') as f:
-                f.write(version.content)
+        """Persist a version to disk with error handling for read-only filesystems."""
+        try:
+            file_dir = self.storage_dir / version.file_id
+            file_dir.mkdir(exist_ok=True)
             
-            # Update version data to reference content file
-            version_data['content_file'] = str(content_file)
-            version_data['content'] = ''  # Clear content from JSON
+            version_file = file_dir / f"pass_{version.pass_number}.json"
             
+            # Store metadata
+            version_data = asdict(version)
             with open(version_file, 'w', encoding='utf-8') as f:
                 json.dump(version_data, f, indent=2, ensure_ascii=False)
+            
+            # Store content separately if it's large
+            if len(version.content) > 10000:  # 10KB threshold
+                content_file = file_dir / f"pass_{version.pass_number}_content.txt"
+                with open(content_file, 'w', encoding='utf-8') as f:
+                    f.write(version.content)
+                
+                # Update version data to reference content file
+                version_data['content_file'] = str(content_file)
+                version_data['content'] = ''  # Clear content from JSON
+                
+                with open(version_file, 'w', encoding='utf-8') as f:
+                    json.dump(version_data, f, indent=2, ensure_ascii=False)
+        except OSError as e:
+            # Silently handle read-only filesystem errors (Lambda/Vercel)
+            if e.errno == 30:  # errno 30 = Read-only file system
+                print(f"Warning: Cannot persist version to read-only filesystem: {e}")
+                return
+            # Log other OS errors but don't fail
+            print(f"Warning: Failed to persist version: {e}")
+        except Exception as e:
+            # Don't fail the entire operation if persistence fails
+            print(f"Warning: Failed to persist version: {e}")
     
     def _load_version(self, file_id: str, pass_number: int) -> Optional[FileVersion]:
         """Load a version from disk."""
