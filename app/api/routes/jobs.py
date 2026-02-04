@@ -478,4 +478,3 @@ async def export_job_to_google_docs(
             status_code=500
         )
 
-

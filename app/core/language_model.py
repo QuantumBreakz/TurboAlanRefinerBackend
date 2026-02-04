@@ -77,11 +77,10 @@ class _Analytics:
         self.schema_usage: Dict[str, int] = {}  # schema_id -> usage_count
         self.schema_last_used: Dict[str, str] = {}  # schema_id -> last_used_timestamp
         
-        # Persistence file path
-        from app.core.paths import get_backend_root
-        from pathlib import Path
-        backend_root = Path(get_backend_root())
-        self._persist_file = str(backend_root / "data" / "analytics_store.json")
+        # Persistence file path (use get_data_dir for Lambda/Vercel compatibility)
+        from app.core.paths import get_data_dir
+        data_dir = get_data_dir()
+        self._persist_file = str(data_dir / "analytics_store.json")
         
         # Load persisted data on startup
         self._load_from_disk()
@@ -116,8 +115,14 @@ class _Analytics:
     def _save_to_disk(self) -> None:
         """Save analytics data to disk"""
         try:
-            # Ensure directory exists
-            os.makedirs(os.path.dirname(self._persist_file), exist_ok=True)
+            # Ensure directory exists (handle read-only filesystems gracefully)
+            try:
+                os.makedirs(os.path.dirname(self._persist_file), exist_ok=True)
+            except OSError as e:
+                # Read-only filesystem (Lambda/Vercel) - silently skip
+                if e.errno == 30:  # errno 30 = Read-only file system
+                    return
+                raise
             
             # Convert deque to list for JSON serialization
             events_list = list(self.events)
@@ -140,9 +145,16 @@ class _Analytics:
             with open(temp_file, 'w') as f:
                 json.dump(data, f)
             os.replace(temp_file, self._persist_file)
+        except OSError as e:
+            # Silently handle read-only filesystem errors (Lambda/Vercel)
+            if e.errno == 30:  # Read-only file system
+                return
+            logger = logging.getLogger(__name__)
+            logger.warning(f"Failed to save analytics to disk: {e}")
+            # Don't fail the request if persistence fails
         except Exception as e:
             logger = logging.getLogger(__name__)
-            logger.warning(f"Failed to save analytics to disk: {e}", exc_info=True)
+            logger.warning(f"Failed to save analytics to disk: {e}")
             # Don't fail the request if persistence fails
 
     def add(self, in_tokens: int, out_tokens: int, model: str = "gpt-4", job_id: str = None, user_id: str = None) -> dict:

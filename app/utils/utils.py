@@ -843,7 +843,7 @@ def write_text_to_file(text: str = None, file_path: str = None, output_dir: str 
     return file_path
 
 
-def _write_text_to_pdf(text: str, file_path: str) -> str:
+def _write_text_to_pdf(text: str, file_path: str, skeleton: Dict[str, Any] = None) -> str:
     """Write text to a PDF file using reportlab or fpdf2."""
     try:
         # Try fpdf2 first (lighter weight)
@@ -857,14 +857,29 @@ def _write_text_to_pdf(text: str, file_path: str) -> str:
         # Handle text encoding and line breaks
         lines = text.split('\n')
         for line in lines:
+            # Skip empty lines that cause "not enough horizontal space" error
+            if not line.strip():
+                pdf.ln(6)  # Add blank line instead
+                continue
+            
             # Encode line to handle special characters
             try:
                 # FPDF2 handles unicode better than fpdf
-                pdf.multi_cell(0, 6, line)
-            except Exception:
+                # Use multi_cell with width parameter to avoid horizontal space errors
+                pdf.multi_cell(0, 6, line if line.strip() else " ")
+            except Exception as e:
+                # Catch specific "horizontal space" errors and other rendering issues
+                if "horizontal space" in str(e).lower() or "not enough" in str(e).lower():
+                    # Skip problematic line and add a blank line
+                    pdf.ln(6)
+                    continue
                 # Fallback: encode to latin-1 with replacement
-                safe_line = line.encode('latin-1', errors='replace').decode('latin-1')
-                pdf.multi_cell(0, 6, safe_line)
+                try:
+                    safe_line = line.encode('latin-1', errors='replace').decode('latin-1')
+                    pdf.multi_cell(0, 6, safe_line if safe_line.strip() else " ")
+                except Exception:
+                    # If even fallback fails, skip this line
+                    pdf.ln(6)
         
         pdf.output(file_path)
         return file_path
