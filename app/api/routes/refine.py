@@ -1007,27 +1007,6 @@ async def _refine_stream(request: RefinementRequest, job_id: str) -> AsyncGenera
         request = apply_preset_to_request(request, request.preset)
         logger.info(f"Applied preset '{request.preset}' to job {job_id}")
     
-    # Create job in MongoDB
-    try:
-        # Extract file info for the first file (assuming single file job for now or primary file)
-        primary_file = request.files[0] if request.files else {}
-        if mongodb_db.is_connected():
-            success = mongodb_db.create_job(
-                job_id=job_id,
-                file_name=primary_file.get("name", "unknown"),
-                file_id=primary_file.get("id", "unknown"),
-                user_id=request.user_id,
-                total_passes=request.passes,
-                model=request.model if hasattr(request, 'model') else "gpt-4",
-                metadata={"heuristics": request.heuristics}
-            )
-            if success:
-                logger.info(f"Created job {job_id} in MongoDB for user {request.user_id}")
-            else:
-                logger.error(f"MongoDB create_job returned False for job {job_id}")
-    except Exception as e:
-        logger.error(f"Failed to create job in MongoDB: {e}", exc_info=True)
-
     pipeline = get_pipeline()
     logger.debug(f"Pipeline initialized successfully")
     memory = memory_manager.get_memory(request.user_id) if request.use_memory else None
