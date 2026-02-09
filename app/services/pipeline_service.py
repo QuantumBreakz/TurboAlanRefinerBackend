@@ -1537,11 +1537,24 @@ class RefinementPipeline:
         # History analysis (MVP): adjust weights based on prior tendencies if enabled
         try:
             hist_cfg = (heur.get('history_analysis') or {}) if isinstance(heur, dict) else {}
-            if hist_cfg is True or (isinstance(hist_cfg, dict) and hist_cfg.get('enabled', True)):
-                # Use centralized path configuration
-                from app.core.paths import get_data_dir
-                default_history = str(get_data_dir() / 'recent_history.json')
+
+            # Determine whether history analysis is enabled and which history path to use.
+            # - If hist_cfg is True (boolean), treat as "enabled with defaults"
+            # - If hist_cfg is a dict, read "enabled" + optional "history_path"
+            # - Any other value → disabled
+            from app.core.paths import get_data_dir
+            default_history = str(get_data_dir() / 'recent_history.json')
+
+            use_history = False
+            history_path = default_history
+
+            if hist_cfg is True:
+                use_history = True
+            elif isinstance(hist_cfg, dict):
+                use_history = hist_cfg.get('enabled', True)
                 history_path = hist_cfg.get('history_path', default_history)
+
+            if use_history:
                 
                 # Validate history file exists and is readable
                 if not os.path.exists(history_path):
