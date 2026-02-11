@@ -873,20 +873,6 @@ async def _process_refinement_pass(
         # Get original file path and extension for format preservation
         original_file_path = file_path
         original_ext = os.path.splitext(file_path)[1] if file_path else None
-        # IMPORTANT: Avoid streaming huge payloads over SSE/WebSocket (especially on Vercel).
-        # Large `textContent` can stall/buffer the response and make the UI appear "hung"
-        # on later passes. The full text is already persisted via file_version_manager.
-        MAX_EVENT_TEXT_CHARS = 200_000
-        text_for_event = ft
-        text_truncated = False
-        try:
-            if isinstance(ft, str) and len(ft) > MAX_EVENT_TEXT_CHARS:
-                text_for_event = ft[:MAX_EVENT_TEXT_CHARS]
-                text_truncated = True
-        except Exception:
-            text_for_event = ft
-            text_truncated = False
-
         pc_evt = {
             'type': 'pass_complete', 
             'jobId': job_id, 
@@ -897,9 +883,7 @@ async def _process_refinement_pass(
             'outputChars': len(ft),
             'outputPath': rr.local_path if hasattr(rr, 'local_path') and rr.local_path else None,
             'cost': pass_cost_info,
-            # If truncated, the frontend can fetch full text via diff/export endpoints.
-            'textContent': text_for_event,
-            'textTruncated': text_truncated,
+            'textContent': ft,  # CRITICAL: Include textContent for diff viewer and downloads
             'originalFilePath': original_file_path,  # Store original file path for style extraction
             'originalExtension': original_ext  # Store original extension for format preservation
         }
@@ -1023,6 +1007,27 @@ async def _refine_stream(request: RefinementRequest, job_id: str) -> AsyncGenera
         request = apply_preset_to_request(request, request.preset)
         logger.info(f"Applied preset '{request.preset}' to job {job_id}")
     
+    # Create job in MongoDB
+    try:
+        # Extract file info for the first file (assuming single file job for now or primary file)
+        primary_file = request.files[0] if request.files else {}
+        if mongodb_db.is_connected():
+            success = mongodb_db.create_job(
+                job_id=job_id,
+                file_name=primary_file.get("name", "unknown"),
+                file_id=primary_file.get("id", "unknown"),
+                user_id=request.user_id,
+                total_passes=request.passes,
+                model=request.model if hasattr(request, 'model') else "gpt-4",
+                metadata={"heuristics": request.heuristics}
+            )
+            if success:
+                logger.info(f"Created job {job_id} in MongoDB for user {request.user_id}")
+            else:
+                logger.error(f"MongoDB create_job returned False for job {job_id}")
+    except Exception as e:
+        logger.error(f"Failed to create job in MongoDB: {e}", exc_info=True)
+
     pipeline = get_pipeline()
     logger.debug(f"Pipeline initialized successfully")
     memory = memory_manager.get_memory(request.user_id) if request.use_memory else None
