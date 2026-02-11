@@ -873,6 +873,20 @@ async def _process_refinement_pass(
         # Get original file path and extension for format preservation
         original_file_path = file_path
         original_ext = os.path.splitext(file_path)[1] if file_path else None
+        # IMPORTANT: Avoid streaming huge payloads over SSE/WebSocket (especially on Vercel).
+        # Large `textContent` can stall/buffer the response and make the UI appear "hung"
+        # on later passes. The full text is already persisted via file_version_manager.
+        MAX_EVENT_TEXT_CHARS = 200_000
+        text_for_event = ft
+        text_truncated = False
+        try:
+            if isinstance(ft, str) and len(ft) > MAX_EVENT_TEXT_CHARS:
+                text_for_event = ft[:MAX_EVENT_TEXT_CHARS]
+                text_truncated = True
+        except Exception:
+            text_for_event = ft
+            text_truncated = False
+
         pc_evt = {
             'type': 'pass_complete', 
             'jobId': job_id, 
@@ -883,7 +897,9 @@ async def _process_refinement_pass(
             'outputChars': len(ft),
             'outputPath': rr.local_path if hasattr(rr, 'local_path') and rr.local_path else None,
             'cost': pass_cost_info,
-            'textContent': ft,  # CRITICAL: Include textContent for diff viewer and downloads
+            # If truncated, the frontend can fetch full text via diff/export endpoints.
+            'textContent': text_for_event,
+            'textTruncated': text_truncated,
             'originalFilePath': original_file_path,  # Store original file path for style extraction
             'originalExtension': original_ext  # Store original extension for format preservation
         }
