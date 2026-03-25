@@ -780,7 +780,12 @@ class RefinementPipeline:
             cur_text = final_norm or ""
 
             # Change/tension proxy
-            ratio = _difflib.SequenceMatcher(None, prev_text, cur_text).ratio()
+            # CRITICAL FIX: Bypass SequenceMatcher O(N^2) on very large texts
+            if len(prev_text) > 15000 or len(cur_text) > 15000:
+                max_len = max(len(prev_text), len(cur_text))
+                ratio = min(len(prev_text), len(cur_text)) / max(1, max_len)
+            else:
+                ratio = _difflib.SequenceMatcher(None, prev_text, cur_text).ratio()
             change_pct = max(0.0, min(100.0, (1.0 - ratio) * 100.0))
             tension_pct = change_pct
             
@@ -851,6 +856,14 @@ class RefinementPipeline:
             def _word_level_ops(a: str, b: str):
                 wa = _words(a)
                 wb = _words(b)
+                total_a = max(1, len(wa))
+                total_b = max(1, len(wb))
+                
+                # CRITICAL FIX: Bypass O(N^2) complexity on massive texts
+                if total_a > 3000 or total_b > 3000:
+                    diff_len = abs(total_a - total_b)
+                    return diff_len, diff_len, diff_len, total_a, total_b
+
                 sm = _difflib.SequenceMatcher(a=wa, b=wb)
                 repl = ins = dele = 0
                 for tag, i1, i2, j1, j2 in sm.get_opcodes():
@@ -860,8 +873,6 @@ class RefinementPipeline:
                         ins += (j2 - j1)
                     elif tag == "delete":
                         dele += (i2 - i1)
-                total_a = max(1, len(wa))
-                total_b = max(1, len(wb))
                 return repl, ins, dele, total_a, total_b
 
             def _edit_noise_per_100w(a: str, b: str) -> float:
@@ -921,7 +932,12 @@ class RefinementPipeline:
                 max_similarity = float((heur or {}).get('gates', {}).get('max_similarity', 0.85))
             except Exception:
                 min_edits, max_similarity = 25.0, 0.85
-            similarity = 1.0 - float(_difflib.SequenceMatcher(None, prev_text, cur_text).ratio())
+            # CRITICAL FIX: Fast approximation for similarity on huge text sets avoiding O(N^2) SequenceMatcher
+            if len(prev_text) > 15000 or len(cur_text) > 15000:
+                max_len = max(len(prev_text), len(cur_text))
+                similarity = min(len(prev_text), len(cur_text)) / max(1, max_len)
+            else:
+                similarity = float(_difflib.SequenceMatcher(None, prev_text, cur_text).ratio())
             if edits_per_100 < min_edits or (1.0 - similarity) > max_similarity:
                 from app.core.logger import log_event as _log2
                 _log2("GATE_RETRY", f"pass={pass_index} edits_per_100={edits_per_100:.2f} similarity={(1.0 - similarity):.2f} -> insufficient change detected")

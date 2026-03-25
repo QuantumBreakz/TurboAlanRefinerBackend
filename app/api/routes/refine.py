@@ -236,8 +236,9 @@ def classify_error(error: Exception) -> tuple[str, str, bool]:
 
 # CRITICAL FIX: Dedicated thread pool for pipeline execution
 # This prevents blocking the main event loop and allows better resource management
-# Max 4 concurrent pipeline jobs to avoid overwhelming the system
-_pipeline_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="pipeline_worker")
+# Scale up concurrent pipeline jobs significantly to prevent queue stalling
+import os
+_pipeline_executor = ThreadPoolExecutor(max_workers=int(os.getenv("MAX_PIPELINE_WORKERS", 20)), thread_name_prefix="pipeline_worker")
 
 class RefinementRequest(BaseModel):
     files: List[Dict[str, Any]]
@@ -1207,16 +1208,28 @@ async def _refine_stream(request: RefinementRequest, job_id: str) -> AsyncGenera
                     pass_timeout_seconds = 20 * 60  # 20 minutes max per pass (generous for large docs)
                     try:
                         async with asyncio.timeout(pass_timeout_seconds):
-                            success, refined_text, metrics, ps, rr = await _process_refinement_pass(
-                                pipeline, 
-                                file_path, 
-                                current_text, 
-                                pass_num, 
-                                request, 
-                                file_id, 
-                                job_id,
-                                output_sink
+                            # Create a background task for the LLM pipeline
+                            pass_task = asyncio.create_task(
+                                _process_refinement_pass(
+                                    pipeline, 
+                                    file_path, 
+                                    current_text, 
+                                    pass_num, 
+                                    request, 
+                                    file_id, 
+                                    job_id,
+                                    output_sink
+                                )
                             )
+                            
+                            # Wait for it, yielding keepalives every 15 seconds to prevent proxy timeouts
+                            while not pass_task.done():
+                                yield ":keepalive\n\n"
+                                done, _ = await asyncio.wait([pass_task], timeout=15.0)
+                                if pass_task in done:
+                                    break
+                                    
+                            success, refined_text, metrics, ps, rr = pass_task.result()
                     except asyncio.TimeoutError:
                         logger.error(f"Pass {pass_num} timed out after {pass_timeout_seconds} seconds")
                         timeout_evt = {'type': 'error', 'jobId': job_id, 'fileId': file_id, 'fileName': file_name, 'pass': pass_num, 'error': f'Pass {pass_num} timed out after {pass_timeout_seconds // 60} minutes. The document may be too large or complex.'}
